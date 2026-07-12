@@ -1,0 +1,38 @@
+# Data files
+data/input/*
+data/output/*
+data/sample/*
+data/spark-events/*
+!data/input/.gitkeep
+!data/output/.gitkeep
+!data/sample/.gitkeep
+!data/spark-events/.gitkeep
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+
+# Spark
+metastore_db/
+spark-warehouse/
+derby.log
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+
+# Docker
+.docker/

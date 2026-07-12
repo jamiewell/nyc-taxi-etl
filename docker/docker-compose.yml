@@ -1,0 +1,62 @@
+version: '3.8'
+
+services:
+  spark-master:
+    image: apache/spark:3.5.3
+    container_name: nyc-taxi-spark
+    hostname: spark-master
+    ports:
+      - "8080:8080"   # Master Web UI
+      - "7077:7077"   # Master port
+      - "4040:4040"   # Application Web UI
+    volumes:
+      - ../jobs:/opt/spark/jobs
+      - ../data:/opt/spark/data
+      - ../scripts:/opt/spark/scripts
+      - ../data/spark-events:/tmp/spark-events
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.master.Master
+    environment:
+      - SPARK_MASTER_HOST=spark-master
+      - SPARK_MASTER_PORT=7077
+      - SPARK_MASTER_WEBUI_PORT=8080
+      - SPARK_HISTORY_OPTS=-Dspark.history.fs.logDirectory=/tmp/spark-events
+    networks:
+      - spark-network
+
+  spark-worker:
+    image: apache/spark:3.5.3
+    container_name: nyc-taxi-worker
+    depends_on:
+      - spark-master
+    ports:
+      - "8081:8081"   # Worker Web UI
+    volumes:
+      - ../jobs:/opt/spark/jobs
+      - ../data:/opt/spark/data
+      - ../data/spark-events:/tmp/spark-events
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.worker.Worker spark://spark-master:7077
+    environment:
+      - SPARK_WORKER_MEMORY=2g
+      - SPARK_WORKER_CORES=2
+      - SPARK_WORKER_WEBUI_PORT=8081
+    networks:
+      - spark-network
+
+  spark-history:
+    image: apache/spark:3.5.3
+    container_name: nyc-taxi-history
+    depends_on:
+      - spark-master
+    ports:
+      - "18080:18080"   # History Server UI
+    volumes:
+      - ../data/spark-events:/tmp/spark-events
+    command: /opt/spark/bin/spark-class org.apache.spark.deploy.history.HistoryServer
+    environment:
+      - SPARK_HISTORY_OPTS=-Dspark.history.fs.logDirectory=/tmp/spark-events -Dspark.history.ui.port=18080
+    networks:
+      - spark-network
+
+networks:
+  spark-network:
+    driver: bridge
