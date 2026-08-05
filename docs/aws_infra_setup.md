@@ -72,8 +72,30 @@ ssh -i ~/.ssh/nyc-taxi-cluster ubuntu@52.78.33.49    # worker 3
 - t2.small 온디맨드 (서울 리전) 약 $0.026/시간 × 4대 ≈ **시간당 $0.10** (상시 가동 시 월 약 $75)
 - EBS(gp3, 인스턴스당 기본 8GB) 및 데이터 전송 비용은 별도
 
+## Spark Standalone 클러스터 구성
+
+**Java/PySpark 버전**: PySpark 3.5.3은 Java 8/11/17만 공식 지원 (Java 21 미지원, Spark 4.x부터 지원). 따라서 **Java 17 (OpenJDK)** 로 설치.
+
+**설치 방식**: 각 노드에 `python3 -m venv ~/pyspark-venv` 가상환경을 만들고 그 안에 `pip install pyspark==3.5.3`. 4대 전부 동일하게 설치.
+
+> pip로 설치한 PySpark 배포판은 `sbin/`에 `start-master.sh` / `start-worker.sh` / `start-all.sh`가 포함되어 있지 않음 (history-server 스크립트만 존재). 그래서 표준 standalone 클러스터처럼 각 노드에서 `sbin/spark-daemon.sh`를 직접 호출해 Master/Worker 데몬을 기동함:
+> - Master: `spark-daemon.sh start org.apache.spark.deploy.master.Master 1 --host <master-private-ip> --port 7077 --webui-port 8080`
+> - Worker: `spark-daemon.sh start org.apache.spark.deploy.worker.Worker 1 spark://<master-private-ip>:7077 --webui-port 8081`
+
+**클러스터 토폴로지**:
+
+| 역할 | 접속 주소 | 상태 |
+|---|---|---|
+| Master | `spark://172.31.3.142:7077`, UI `http://3.34.200.25:8080` | ALIVE |
+| Worker 1/2/3 | Master에 자동 등록 | 3대 모두 ALIVE, 각 1 core / 1024MB |
+
+**검증**: `spark-submit --master spark://172.31.3.142:7077 examples/src/main/python/pi.py 10` 실행 → 클러스터 전체 분산 실행 확인 완료.
+
+**알려진 제약**:
+- `spark-daemon.sh`로 기동한 데몬은 systemd 서비스가 아니라 단순 프로세스라 **EC2 재부팅 시 자동 재기동되지 않음** — 상시 운영하려면 systemd unit 등록 필요.
+- Worker 리소스가 t2.small 스펙(1 core/1024MB)만큼만 잡혀 있어, job 제출 시 `--executor-memory`를 낮게(예: 512m) 지정하지 않으면 리소스 부족 발생 가능.
+
 ## 남은 작업
 
-- 각 노드에 Java 17 + PySpark 3.5.3 설치
-- Master/Worker 간 Spark standalone 클러스터 구성 (네이티브 설치 또는 기존 `docker/docker-compose.yml` 방식 재사용 검토)
-- `scripts/submit.sh`를 EC2 클러스터 대상으로 확장
+- Spark 데몬 systemd 서비스화 (재부팅 시 자동 기동)
+- `scripts/submit.sh`를 EC2 클러스터(`spark://172.31.3.142:7077`) 대상으로 확장
