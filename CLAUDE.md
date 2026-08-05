@@ -10,31 +10,38 @@
 이 프로젝트는 단순 ETL이 아니라 NYC Taxi 데이터를 기반으로 Raw → Cleaned → Fact → Mart Layer를 구성하는 데이터 엔지니어링 프로젝트이다.
 
 최종 목표:
-1. 월별 신규 taxi trip 데이터를 수집한다.
-2. raw 데이터를 cleaned layer로 정제한다.
-3. fact_taxi_trip 테이블을 생성한다.
-4. dim_vendor, dim_taxi_zone, dim_date, dim_time 차원을 구성한다.
-5. 분석 목적별 mart table을 생성한다.
-6. Spark UI 기반으로 groupBy, join, shuffle 성능을 측정하고 개선한다.
+1. 월별 신규 taxi trip 데이터를 수집한다. ✓
+2. raw 데이터를 cleaned layer로 정제한다. ✓
+3. fact_taxi_trip 테이블을 생성한다. ✓
+4. dim_vendor, dim_taxi_zone, dim_date, dim_time 차원을 구성한다. (dim_vendor, dim_taxi_zone 완료 / dim_date, dim_time 미구현)
+5. 분석 목적별 mart table을 생성한다. ✓ (4개 mart 모두 구현 완료, 아래 참고)
+6. Spark UI 기반으로 groupBy, join, shuffle 성능을 측정하고 개선한다. (진행 중, `docs/spark_performance_analysis_guide.md` 참고)
 
 ## 아키텍처
 
-**데이터 흐름**: Raw parquet/CSV → PySpark ETL job → 정제/강화된 parquet (year/month 파티셔닝)
+**데이터 흐름**: Source parquet/CSV → **Raw Layer** → **Cleaned Layer** → **Fact/Dimension Layer** → **Mart Layer** (레이어별 parquet, year/month 파티셔닝)
+
+`jobs/main.py`가 전체 파이프라인을 순서대로 오케스트레이션한다. 각 job 파일은 레이어 하나만 담당한다 (개발 원칙 참고).
 
 **실행 환경**:
 - **로컬 모드**: 호스트 머신에서 직접 PySpark 실행 (Java 17 + PySpark 3.5.3)
 - **클러스터 모드**: Docker Spark standalone 클러스터 (Bitnami Spark 이미지)
 
 **주요 구성요소**:
-- `jobs/nyc_taxi_etl.py`: 메인 ETL 로직 (read → transform → write)
-- `scripts/submit.sh`: `docker exec`로 Docker Spark 클러스터에 job 제출
+- `jobs/main.py`: 파이프라인 오케스트레이터. `spark-submit main.py <input_path> <base_output_path> [zone_lookup_path]`로 실행
+- `jobs/save_raw_layer.py`: Source → Raw Layer (`read_source_data`, `save_to_raw_layer`). 변형 없이 `year`/`month` 파티션으로 원본 보존
+- `jobs/raw_to_cleaned.py`: Raw → Cleaned Layer (`read_raw_data`, `transform_to_cleaned`, `write_cleaned_data`). 시간 피처 추출, trip_duration 계산, 품질 필터, 컬럼 표준화. `pickup_year`/`pickup_month` 파티션
+- `jobs/cleaned_to_fact.py`: Cleaned → Fact/Dimension Layer (`build_and_write_dim_vendor`, `build_and_write_dim_taxi_zone`, `transform_to_fact`, `write_fact_table`). `dim_taxi_zone`은 `data/reference/taxi_zone_lookup.csv`(NYC TLC 공식, 265개 zone)에서 생성
+- `jobs/fact_to_mart_zone.py`, `fact_to_mart_vendor.py`, `fact_to_mart_vendor_cumulative.py`, `fact_to_mart_zone_cumulative.py`: Fact/Dim → Mart Layer, mart 4종 각각 담당
+- `jobs/nyc_taxi_etl.py`: (구) 단일 파일 ETL. `main.py` 파이프라인 도입 이전 버전으로, 현재는 사용되지 않지만 삭제되지 않고 남아 있음
+- `scripts/submit.sh`: `docker exec`로 Docker Spark 클러스터에 job 제출. 기본 job은 `jobs/main.py`이며 4번째 인자로 zone_lookup_path 전달 가능
 - `docker/docker-compose.yml`: Spark master + worker 서비스 정의
 - `docker/Dockerfile`: 커스텀 Spark 3.5.3 이미지 (현재 미사용; 프로젝트는 bitnami/spark 사용)
 
-**ETL 변환 작업** (`jobs/nyc_taxi_etl.py:29-63`):
-- 시간 피처 추출: `tpep_pickup_datetime`에서 year, month, day, hour, dayofweek 추출
-- 데이터 품질 필터: passenger_count > 0, trip_distance > 0, fare_amount > 0, total_amount > 0
-- 출력 파티셔닝: `pickup_year`, `pickup_month` 기준
+**데이터 품질 필터** (`jobs/raw_to_cleaned.py`):
+- null 체크: pickup/dropoff datetime, PULocationID, DOLocationID
+- 시간 유효성: dropoff > pickup, trip_duration 0~1440분(24시간) 이내
+- 비즈니스 로직: passenger_count 1~8, trip_distance 0~200마일, fare_amount > 0, total_amount > 0
 
 ## 자주 사용하는 명령어
 
@@ -58,16 +65,17 @@ cd docker && docker-compose down
 
 ### ETL Job 실행
 
-Docker 클러스터에 제출 (프로젝트 루트에서):
+Docker 클러스터에 제출 (프로젝트 루트에서, 기본 job은 `jobs/main.py`):
 ```bash
 ./scripts/submit.sh
-# 또는 커스텀 경로 지정:
-./scripts/submit.sh jobs/nyc_taxi_etl.py data/input/my_data.parquet data/output/result
+# 또는 커스텀 경로 지정 (input_path, output_base_path, [zone_lookup_path]):
+./scripts/submit.sh jobs/main.py data/sample/yellow_tripdata_2026-01.parquet data/output
+./scripts/submit.sh jobs/main.py data/sample/yellow_tripdata_2026-01.parquet data/output data/reference/taxi_zone_lookup.csv
 ```
 
 로컬에서 실행 (호스트에 Java 17 + PySpark 3.5.3 필요):
 ```bash
-python3 jobs/nyc_taxi_etl.py data/sample/yellow_tripdata_2026-01.parquet data/output/processed
+python3 jobs/main.py data/sample/yellow_tripdata_2026-01.parquet data/output
 ```
 
 ### 모니터링
@@ -80,17 +88,23 @@ Job 실행 중 접속 가능한 UI:
 
 ### 데이터 관리
 
-입력 데이터 위치: `data/input/` 또는 `data/sample/`
-출력 데이터 위치: `data/output/processed/` (파티셔닝된 parquet)
+입력 데이터 위치: `data/input/` 또는 `data/sample/`, dim_taxi_zone 참조 데이터: `data/reference/taxi_zone_lookup.csv`
+
+출력 데이터 위치 (레이어별, `data/output/` 하위):
+- `raw/yellow_trip/year=.../month=.../` — Raw Layer
+- `cleaned/yellow_trip/pickup_year=.../pickup_month=.../` — Cleaned Layer
+- `warehouse/fact_taxi_trip/year=.../month=.../` — Fact Layer
+- `dim/vendor/`, `dim/taxi_zone/` — Dimension Layer
+- `mart/mart_month_hour_zone_trip_metrics/`, `mart/mart_month_hour_vendor_trip_metrics/`, `mart/mart_month_vendor_cumulative_metrics/`, `mart/mart_month_zone_cumulative_metrics/` — Mart Layer (각각 `year=.../month=.../` 파티션)
 
 ## 개발 노트
 
-**볼륨 마운트**: Docker 컨테이너는 로컬 디렉토리를 마운트:
-- `jobs/` → `/opt/bitnami/spark/jobs/`
-- `data/` → `/opt/bitnami/spark/data/`
-- `scripts/` → `/opt/bitnami/spark/scripts/`
+**볼륨 마운트**: Docker 컨테이너는 로컬 디렉토리를 마운트 (`docker/docker-compose.yml`):
+- `jobs/` → `/opt/spark/jobs/`
+- `data/` → `/opt/spark/data/`
+- `scripts/` → `/opt/spark/scripts/`
 
-`jobs/nyc_taxi_etl.py` 변경 사항은 재빌드 없이 컨테이너에서 즉시 사용 가능합니다.
+`jobs/` 아래 변경 사항은 재빌드 없이 컨테이너에서 즉시 사용 가능합니다.
 
 **클러스터 설정** (`docker/docker-compose.yml`):
 - Master: 1개 인스턴스, 포트 7077
@@ -103,8 +117,8 @@ Job 실행 중 접속 가능한 UI:
 - Executor memory: 1g
 - Executor cores: 1
 
-**스키마 전제조건** (`jobs/nyc_taxi_etl.py`):
-ETL job은 다음 컬럼을 포함한 입력 데이터를 기대합니다: `tpep_pickup_datetime`, `passenger_count`, `trip_distance`, `fare_amount`, `total_amount`. 컬럼 누락 시 job이 실패합니다.
+**스키마 전제조건** (`jobs/raw_to_cleaned.py`):
+파이프라인은 다음 컬럼을 포함한 입력 데이터를 기대합니다: `tpep_pickup_datetime`, `tpep_dropoff_datetime`, `VendorID`, `PULocationID`, `DOLocationID`, `RatecodeID`, `payment_type`, `store_and_fwd_flag`, `passenger_count`, `trip_distance`, `fare_amount`, `extra`, `mta_tax`, `tip_amount`, `tolls_amount`, `improvement_surcharge`, `total_amount`, `congestion_surcharge`, `Airport_fee`, `cbd_congestion_fee`. 컬럼 누락 시 job이 실패합니다.
 
 ## 마이그레이션 계획
 
