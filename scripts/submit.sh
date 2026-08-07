@@ -1,8 +1,10 @@
 #!/bin/bash
 
 # Submit PySpark job to Docker Spark cluster
-# Usage: ./scripts/submit.sh <job_file> <input_path> <output_path> [zone_lookup_path]
+# Usage: ./scripts/submit.sh <job_file> <input_path> <output_path> [zone_lookup_path] [taxi_types]
 # Environment: Set ENV=aws for AWS S3, default is local
+# taxi_types: comma-separated (yellow,green,fhvhv,fhv) or "all". Default: yellow
+#             Can also be set via TAXI_TYPES env var.
 
 set -e
 
@@ -13,7 +15,7 @@ JOB_FILE=${1:-jobs/main.py}
 
 # Set default paths based on environment
 if [[ "$ENV" == "aws" ]]; then
-    INPUT_PATH=${2:-s3://nyc-taxi-data/raw/yellow_tripdata_2026-01.parquet}
+    INPUT_PATH=${2:-s3://nyc-taxi-collector-raw/raw/nyc_taxi/yellow}
     OUTPUT_PATH=${3:-s3://nyc-taxi-data/processed/}
     ZONE_LOOKUP_PATH=${4:-s3://nyc-taxi-data/ref/taxi_zone_lookup.csv}
     echo "Environment: AWS (S3)"
@@ -24,6 +26,8 @@ else
     echo "Environment: Local"
 fi
 
+TAXI_TYPES=${5:-${TAXI_TYPES:-yellow}}
+
 echo "========================================"
 echo "Submitting Spark Job to Docker Cluster"
 echo "========================================"
@@ -31,6 +35,7 @@ echo "Job File: $JOB_FILE"
 echo "Input Path: $INPUT_PATH"
 echo "Output Path: $OUTPUT_PATH"
 echo "Zone Lookup Path: $ZONE_LOOKUP_PATH"
+echo "Taxi Types: $TAXI_TYPES"
 echo "========================================"
 
 # Determine if paths need container prefix
@@ -60,7 +65,8 @@ docker exec nyc-taxi-spark /opt/spark/bin/spark-submit \
   $CONTAINER_JOB_FILE \
   $CONTAINER_INPUT_PATH \
   $CONTAINER_OUTPUT_PATH \
-  $CONTAINER_ZONE_LOOKUP_PATH
+  $CONTAINER_ZONE_LOOKUP_PATH \
+  --taxi-types "$TAXI_TYPES"
 
 echo ""
 echo "========================================"

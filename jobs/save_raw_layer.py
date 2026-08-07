@@ -5,6 +5,16 @@ Preserve source data to Raw Layer without transformation
 from pyspark.sql import DataFrame
 from pyspark.sql.functions import year, month
 
+# Pickup datetime column name differs by taxi type; used only to derive the
+# year/month partition columns for the raw layer (source data itself is not
+# renamed or otherwise modified).
+PICKUP_DATETIME_COLUMN = {
+    "yellow": "tpep_pickup_datetime",
+    "green": "lpep_pickup_datetime",
+    "fhvhv": "pickup_datetime",
+    "fhv": "pickup_datetime",
+}
+
 
 def read_source_data(spark, input_path):
     """
@@ -50,17 +60,24 @@ def read_source_data(spark, input_path):
     return df
 
 
-def save_to_raw_layer(df: DataFrame, output_path: str):
+def save_to_raw_layer(df: DataFrame, output_path: str, taxi_type: str = "yellow"):
     """
     Save data to Raw Layer with year/month partition
     No transformation, preserve original data
     """
-    print(f"\nSaving to Raw Layer: {output_path}")
+    if taxi_type not in PICKUP_DATETIME_COLUMN:
+        raise ValueError(
+            f"Unknown taxi_type: {taxi_type!r}. Must be one of {sorted(PICKUP_DATETIME_COLUMN)}"
+        )
+
+    print(f"\nSaving to Raw Layer: {output_path} (taxi_type={taxi_type})")
+
+    pickup_col = PICKUP_DATETIME_COLUMN[taxi_type]
 
     # Add partition columns for storage
     df_with_partition = df \
-        .withColumn("year", year("tpep_pickup_datetime")) \
-        .withColumn("month", month("tpep_pickup_datetime"))
+        .withColumn("year", year(pickup_col)) \
+        .withColumn("month", month(pickup_col))
 
     # Write to raw layer
     df_with_partition.write \
