@@ -8,10 +8,31 @@ from pyspark.sql import SparkSession
 VALID_TAXI_TYPES = ("yellow", "green", "fhvhv", "fhv")
 
 
-def create_spark_session(app_name="NYC Taxi ETL"):
-    """Create and configure Spark session"""
+VALID_OVERWRITE_MODES = ("static", "dynamic")
+
+
+def create_spark_session(app_name="NYC Taxi ETL", overwrite_mode="dynamic"):
+    """
+    Create and configure Spark session.
+
+    partitionOverwriteMode controls what "overwrite" mode does on a
+    partitioned write (see --overwrite-mode help / docs/known_issues_and_fixes.md #5):
+      - dynamic (default, safe for --start-year-month/--end-year-month):
+        only the year=/month= partitions present in the DataFrame being
+        written are replaced; other months already on disk are untouched.
+      - static (Spark's own default): the ENTIRE output path is deleted and
+        rewritten from the DataFrame's contents. Re-running a narrow date
+        range in this mode deletes every other month previously written to
+        that path - only use it when you deliberately want a full rebuild.
+    """
+    if overwrite_mode not in VALID_OVERWRITE_MODES:
+        raise ValueError(
+            f"Invalid overwrite_mode: {overwrite_mode!r}. Must be one of {VALID_OVERWRITE_MODES}"
+        )
+
     return SparkSession.builder \
         .appName(app_name) \
+        .config("spark.sql.sources.partitionOverwriteMode", overwrite_mode) \
         .getOrCreate()
 
 
@@ -58,10 +79,44 @@ def parse_args():
             "'all' for every type. Default: yellow"
         ),
     )
+    parser.add_argument(
+        "--start-year-month",
+        default=None,
+        help=(
+            "Inclusive start of the collection range, format YYYY-MM. When set "
+            "(alone or with --end-year-month), source_path is always treated as "
+            "the collector bucket base prefix ('<source_path>/<taxi_type>/"
+            "year=Y/month=M') regardless of how many taxi types are selected, "
+            "and only the months that actually exist there are processed - "
+            "there is no metadata table, so existence is checked against the "
+            "source itself. Default: earliest available."
+        ),
+    )
+    parser.add_argument(
+        "--end-year-month",
+        default=None,
+        help="Inclusive end of the collection range, format YYYY-MM. Default: latest available.",
+    )
+    parser.add_argument(
+        "--overwrite-mode",
+        default="dynamic",
+        choices=VALID_OVERWRITE_MODES,
+        help=(
+            "Spark partition overwrite behavior for raw/cleaned writes. "
+            "'dynamic' (default) only replaces the year=/month= partitions being "
+            "written, leaving other months on disk untouched - safe to use with "
+            "--start-year-month/--end-year-month for incremental runs. "
+            "'static' deletes and rewrites the ENTIRE output path every run "
+            "(Spark's own default) - only use for a deliberate full rebuild, "
+            "since combined with a narrow date range it will delete previously "
+            "processed months. See docs/known_issues_and_fixes.md #5."
+        ),
+    )
     return parser.parse_args()
 
 
-def run_raw_and_cleaned_layer(spark, source_path, base_output_path, taxi_type, is_multi_type):
+def run_raw_and_cleaned_layer(spark, source_path, base_output_path, taxi_type, is_multi_type,
+                               start_year_month=None, end_year_month=None):
     """
     Runs Raw Layer + Cleaned Layer for a single taxi type.
     Returns the cleaned layer path so the caller can feed it into Fact/Dim.
@@ -69,7 +124,13 @@ def run_raw_and_cleaned_layer(spark, source_path, base_output_path, taxi_type, i
     from save_raw_layer import read_source_data, save_to_raw_layer
     from raw_to_cleaned import read_raw_data, transform_to_cleaned, write_cleaned_data
 
-    type_source_path = f"{source_path}/{taxi_type}" if is_multi_type else source_path
+    if start_year_month or end_year_month:
+        from collection_range import resolve_year_month_paths
+        type_source_path = resolve_year_month_paths(
+            spark, source_path, taxi_type, start_year_month, end_year_month
+        )
+    else:
+        type_source_path = f"{source_path}/{taxi_type}" if is_multi_type else source_path
     raw_layer_path = f"{base_output_path}/raw/{taxi_type}_trip"
     cleaned_layer_path = f"{base_output_path}/cleaned/{taxi_type}_trip"
 
@@ -216,10 +277,19 @@ def main():
 
       All four types:
         spark-submit main.py s3://nyc-taxi-collector-raw/raw/nyc_taxi s3://bucket/output --taxi-types all
+
+      Specific collection range (only months that actually exist in the source are processed):
+        spark-submit main.py s3://nyc-taxi-collector-raw/raw/nyc_taxi s3://bucket/output \\
+          --taxi-types yellow,green --start-year-month 2025-06 --end-year-month 2025-12
+
+      Force a full rebuild of the output path instead of incremental partition updates:
+        spark-submit main.py s3://nyc-taxi-collector-raw/raw/nyc_taxi s3://bucket/output \\
+          --taxi-types all --overwrite-mode static
     """
     args = parse_args()
     taxi_types = parse_taxi_types(args.taxi_types)
     is_multi_type = len(taxi_types) > 1
+    has_range = bool(args.start_year_month or args.end_year_month)
 
     print("\n" + "=" * 70)
     print("NYC Taxi ETL Pipeline - Data Layer Processing")
@@ -227,14 +297,25 @@ def main():
     print(f"Taxi types: {taxi_types}")
     print(f"Source: {args.source_path}")
     print(f"Base output: {args.base_output_path}")
+    print(f"Overwrite mode: {args.overwrite_mode}")
+    if has_range:
+        print(f"Collection range: {args.start_year_month or 'earliest'} ~ {args.end_year_month or 'latest'}")
 
-    spark = create_spark_session()
+    if args.overwrite_mode == "static" and has_range:
+        print(
+            "WARNING: --overwrite-mode static with a narrowed collection range will "
+            "DELETE any previously written months outside this run's range under "
+            "each output path (raw/cleaned). See docs/known_issues_and_fixes.md #5."
+        )
+
+    spark = create_spark_session(overwrite_mode=args.overwrite_mode)
 
     try:
         cleaned_paths_by_type = {}
         for taxi_type in taxi_types:
             cleaned_paths_by_type[taxi_type] = run_raw_and_cleaned_layer(
-                spark, args.source_path, args.base_output_path, taxi_type, is_multi_type
+                spark, args.source_path, args.base_output_path, taxi_type, is_multi_type,
+                start_year_month=args.start_year_month, end_year_month=args.end_year_month
             )
 
         # Fact/Dim/Mart currently only understand the yellow schema.

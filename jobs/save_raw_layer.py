@@ -19,15 +19,23 @@ PICKUP_DATETIME_COLUMN = {
 def read_source_data(spark, input_path):
     """
     Read source data from external location (local, S3, etc)
-    """
-    print(f"Reading source data from: {input_path}")
 
+    input_path may be a single path string, or a list of paths (e.g. the
+    specific year=/month= partition paths resolved by
+    collection_range.resolve_year_month_paths for a --start-year-month /
+    --end-year-month range). All paths in a list must be readable in a
+    single format (parquet or CSV, not mixed).
+    """
+    paths = input_path if isinstance(input_path, list) else [input_path]
+    print(f"Reading source data from ({len(paths)} path(s)): {paths}")
+
+    first_path = paths[0]
     # Determine storage type
-    if input_path.startswith("s3://") or input_path.startswith("s3a://"):
+    if first_path.startswith("s3://") or first_path.startswith("s3a://"):
         storage_type = "AWS S3"
-    elif input_path.startswith("gs://"):
+    elif first_path.startswith("gs://"):
         storage_type = "Google Cloud Storage"
-    elif input_path.startswith("hdfs://"):
+    elif first_path.startswith("hdfs://"):
         storage_type = "HDFS"
     else:
         storage_type = "Local filesystem"
@@ -36,23 +44,23 @@ def read_source_data(spark, input_path):
 
     # Read data
     try:
-        df = spark.read.parquet(input_path)
+        df = spark.read.parquet(*paths)
         print(f"Successfully loaded parquet from {storage_type}")
     except Exception as e:
         print(f"Failed to read as parquet: {str(e)}")
         try:
-            df = spark.read.option("header", "true").option("inferSchema", "true").csv(input_path)
+            df = spark.read.option("header", "true").option("inferSchema", "true").csv(*paths)
             print(f"Successfully loaded CSV from {storage_type}")
         except Exception as e:
-            raise ValueError(f"Cannot read data from {input_path}. Error: {str(e)}")
+            raise ValueError(f"Cannot read data from {paths}. Error: {str(e)}")
 
     # Validate
     if df is None:
-        raise ValueError(f"Failed to load data from {input_path}")
+        raise ValueError(f"Failed to load data from {paths}")
 
     record_count = df.count()
     if record_count == 0:
-        raise ValueError(f"Source data is empty (0 records) from {input_path}")
+        raise ValueError(f"Source data is empty (0 records) from {paths}")
 
     print(f"Source records: {record_count:,}")
     df.printSchema()
