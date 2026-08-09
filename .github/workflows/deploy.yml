@@ -1,0 +1,135 @@
+name: Deploy to EC2 Spark Master
+
+# Manual trigger only - the master node is normally stopped to avoid EC2
+# cost, so every run starts it first. See docs/deployment.md.
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to deploy (branch, tag, or commit SHA)"
+        required: false
+        default: "main"
+
+env:
+  AWS_REGION: ap-northeast-2
+  MASTER_INSTANCE_ID: i-0131fffaf58ee5509
+  SECURITY_GROUP_ID: sg-0cffb9429839840cd
+  DEPLOY_USER: ubuntu
+  DEPLOY_PATH: /home/ubuntu/nyc-taxi-batch
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.ref }}
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Start master instance if stopped
+        run: |
+          STATE=$(aws ec2 describe-instances --instance-ids "$MASTER_INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].State.Name' --output text)
+          echo "Current state: $STATE"
+          if [ "$STATE" = "stopped" ]; then
+            aws ec2 start-instances --instance-ids "$MASTER_INSTANCE_ID"
+          fi
+          aws ec2 wait instance-running --instance-ids "$MASTER_INSTANCE_ID"
+          aws ec2 wait instance-status-ok --instance-ids "$MASTER_INSTANCE_ID"
+
+      - name: Resolve master public IP
+        id: master
+        run: |
+          IP=$(aws ec2 describe-instances --instance-ids "$MASTER_INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          echo "ip=$IP" >> "$GITHUB_OUTPUT"
+          echo "Master public IP: $IP"
+
+      - name: Get this runner's public IP
+        id: runner
+        run: |
+          IP=$(curl -s -4 https://checkip.amazonaws.com)
+          echo "ip=$IP" >> "$GITHUB_OUTPUT"
+          echo "Runner public IP: $IP"
+
+      # The security group only ever allows SSH from one specific IP at a
+      # time (see docs/aws_infra_setup.md). GitHub-hosted runners don't have
+      # a fixed IP, so this run's IP is authorized just long enough to
+      # deploy, then revoked in the cleanup step below - the SG is never
+      # left open beyond this job.
+      - name: Temporarily allow this runner's IP for SSH
+        run: |
+          aws ec2 authorize-security-group-ingress \
+            --group-id "$SECURITY_GROUP_ID" \
+            --protocol tcp --port 22 \
+            --cidr "${{ steps.runner.outputs.ip }}/32"
+
+      - name: Set up SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+
+      - name: Wait for SSH to be ready
+        run: |
+          for i in $(seq 1 30); do
+            if ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new -o ConnectTimeout=5 \
+                 "$DEPLOY_USER@${{ steps.master.outputs.ip }}" "echo ok" 2>/dev/null; then
+              echo "SSH ready"
+              exit 0
+            fi
+            echo "Waiting for SSH... ($i/30)"
+            sleep 10
+          done
+          echo "SSH did not become ready in time" >&2
+          exit 1
+
+      - name: Deploy code via rsync
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new \
+            "$DEPLOY_USER@${{ steps.master.outputs.ip }}" "mkdir -p $DEPLOY_PATH"
+
+          rsync -az --delete \
+            -e "ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new" \
+            --exclude='.git' \
+            --exclude='.github' \
+            --exclude='.claude' \
+            --exclude='.codex' \
+            --exclude='data/output' \
+            --exclude='data/spark-events' \
+            --exclude='data/scratch_*' \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            ./ "$DEPLOY_USER@${{ steps.master.outputs.ip }}:$DEPLOY_PATH/"
+
+      - name: Verify deployed code imports and parses cleanly
+        run: |
+          ssh -i ~/.ssh/deploy_key -o StrictHostKeyChecking=accept-new \
+            "$DEPLOY_USER@${{ steps.master.outputs.ip }}" "
+              source ~/pyspark-venv/bin/activate
+              export JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64
+              cd $DEPLOY_PATH
+              python3 jobs/main.py --help
+            "
+
+      - name: Revoke temporary SSH access for this runner's IP
+        if: always()
+        run: |
+          aws ec2 revoke-security-group-ingress \
+            --group-id "$SECURITY_GROUP_ID" \
+            --protocol tcp --port 22 \
+            --cidr "${{ steps.runner.outputs.ip }}/32" || true
+
+      - name: Summary
+        if: success()
+        run: |
+          echo "Deployed to $DEPLOY_USER@${{ steps.master.outputs.ip }}:$DEPLOY_PATH"
+          echo "Master node is still RUNNING - stop it manually (or via AWS CLI) when done to avoid ongoing EC2 cost:"
+          echo "  aws ec2 stop-instances --instance-ids $MASTER_INSTANCE_ID --region $AWS_REGION"

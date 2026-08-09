@@ -69,3 +69,28 @@ spark-daemon.sh start org.apache.spark.deploy.worker.Worker 1 spark://<master-ip
 **원인 확인**: 실제 `nyc-taxi-collector`가 Lambda에서 S3에 쓰는 키 규칙(`s3_key = f"{BASE_PREFIX}/{taxi_type}/year={year}/month={month:02d}/..."`)은 zero-padded이고, `aws s3 ls`로 실제 버킷을 확인해도 `month=01` ~ `month=12` 형태임을 재확인. 즉 코드 자체는 실제 운영 데이터 규칙과 정확히 일치했고, 로컬 재현 테스트에서 Spark의 `partitionBy` 자동 파티셔닝(zero-padding 없음)을 그대로 써서 생긴 테스트 픽스처 불일치였음.
 
 **조치**: 테스트 데이터 생성 스크립트를 `partitionBy` 대신 zero-padded 경로(`year={y}/month={m:02d}`)에 명시적으로 쓰도록 수정해 재현 테스트 통과 확인. 프로덕션 코드는 변경 없음.
+
+## 7. GitHub Actions ↔ EC2 배포 연동 시 확인된 이슈
+
+`main` 브랜치를 EC2 Spark 마스터 노드에 배포하는 GitHub Actions 워크플로우(`.github/workflows/deploy.yml`, 상세는 `docs/deployment.md`)를 구성하며 확인된 사항들.
+
+**이슈 1: root 계정 자격증명을 GitHub Secrets에 넣는 것은 위험**
+
+`aws sts get-caller-identity`로 확인해보니 로컬에서 쓰던 `cotedazure12` 프로파일이 IAM 사용자가 아니라 **root 계정** 자격증명이었음. GitHub Secrets에 root 키를 등록하면 유출 시 계정 전체가 뚫림.
+
+**조치**: 배포 전용 IAM 사용자 `github-actions-nyc-taxi-deploy`를 새로 생성하고, 필요한 작업(마스터 인스턴스 조회/기동, 배포용 보안그룹 규칙 추가/삭제)만 허용하는 최소 권한 정책을 부여. `ec2:StartInstances`도 마스터 인스턴스 ARN으로 한정해, 다른 인스턴스는 이 자격증명으로 건드릴 수 없게 함.
+
+**이슈 2: IP 제한 보안그룹이 GitHub-hosted runner와 근본적으로 충돌**
+
+기존 보안그룹은 SSH(22)를 관리자 개인 IP `/32`에만 허용하도록 되어 있었음(`docs/aws_infra_setup.md`). GitHub Actions의 hosted runner는 매 실행마다 IP가 바뀌기 때문에, 이 구조로는 애초에 워크플로우가 마스터에 SSH 접속을 못 함.
+
+**검토한 대안과 선택 이유**:
+- 0.0.0.0/0 상시 개방 → 기각 (공격 표면 확대)
+- GitHub 공개 IP 대역(`api.github.com/meta`) 상시 허용 → 기각 (범위가 넓고 유지보수 필요)
+- **채택**: 워크플로우 실행 시점에 그 runner의 현재 IP만 SG에 임시로 authorize하고, 배포가 끝나면(성공/실패 무관하게 `if: always()`) 즉시 revoke. 평소 SG는 기존과 동일하게 좁은 상태를 유지.
+
+**이슈 3: 마스터 노드 Public IP가 stop/start마다 바뀜 (기존에 알려진 제약, 배포 워크플로우에도 동일 적용)**
+
+Elastic IP를 쓰지 않기로 한 기존 결정(`docs/aws_infra_setup.md`)에 따라, 배포 워크플로우도 매 실행마다 `describe-instances`로 현재 Public IP를 동적 조회해서 SSH 대상으로 사용하도록 구성. 하드코딩된 IP를 GitHub Secrets 등에 저장하지 않음.
+
+**작업 순서상 특이사항**: 워크플로우 코드를 작성하기 전에, 마스터 인스턴스를 실제로 잠깐 기동해서 `rsync` 배포 + `python3 jobs/main.py --help` 검증까지 수동으로 먼저 실행해 각 단계(SSH 접속, rsync, venv 활성화, 배포된 코드 import)가 실제로 동작하는지 확인한 뒤, 그 명령어들을 그대로 워크플로우 YAML에 옮겼음. 이 과정에서 로컬 관리자 IP가 이전 등록값과 달라져 있어 보안그룹 규칙을 먼저 갱신해야 했음 (동적 IP 환경에서 인프라 작업 시 흔히 겪는 문제).
