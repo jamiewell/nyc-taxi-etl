@@ -124,15 +124,24 @@ def run_raw_and_cleaned_layer(spark, source_path, base_output_path, taxi_type, i
     from save_raw_layer import read_source_data, save_to_raw_layer
     from raw_to_cleaned import read_raw_data, transform_to_cleaned, write_cleaned_data
 
-    if start_year_month or end_year_month:
-        from collection_range import resolve_year_month_paths
-        type_source_path = resolve_year_month_paths(
-            spark, source_path, taxi_type, start_year_month, end_year_month
-        )
-    else:
-        type_source_path = f"{source_path}/{taxi_type}" if is_multi_type else source_path
     raw_layer_path = f"{base_output_path}/raw/{taxi_type}_trip"
     cleaned_layer_path = f"{base_output_path}/cleaned/{taxi_type}_trip"
+
+    # cleaned_read_path scopes STEP 2's read to just the months this run
+    # touches. Without it, Cleaned Layer would read the entire raw layer
+    # directory every time - forcing Spark to merge Parquet schemas across
+    # every month ever written there, including older runs whose files can
+    # have incompatible physical encodings for the same logical column (see
+    # docs/known_issues_and_fixes.md).
+    if start_year_month or end_year_month:
+        from collection_range import resolve_year_months, raw_layer_month_paths
+        year_months = resolve_year_months(spark, source_path, taxi_type, start_year_month, end_year_month)
+        type_path = f"{source_path.rstrip('/')}/{taxi_type}"
+        type_source_path = [f"{type_path}/year={y}/month={m:02d}" for y, m in year_months]
+        cleaned_read_path = raw_layer_month_paths(raw_layer_path, year_months)
+    else:
+        type_source_path = f"{source_path}/{taxi_type}" if is_multi_type else source_path
+        cleaned_read_path = raw_layer_path
 
     print("=" * 70)
     print(f"STEP 1: Raw Layer ({taxi_type}) - Preserving source data")
@@ -150,7 +159,7 @@ def run_raw_and_cleaned_layer(spark, source_path, base_output_path, taxi_type, i
     print("=" * 70)
     print(f"Cleaned Layer: {cleaned_layer_path}")
 
-    df_raw = read_raw_data(spark, raw_layer_path)
+    df_raw = read_raw_data(spark, cleaned_read_path)
     df_cleaned = transform_to_cleaned(df_raw, taxi_type=taxi_type)
     write_cleaned_data(df_cleaned, cleaned_layer_path)
 

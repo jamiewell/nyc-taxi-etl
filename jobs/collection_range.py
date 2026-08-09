@@ -70,16 +70,17 @@ def list_available_year_months(spark, base_path: str, taxi_type: str):
     return sorted(set(year_months))
 
 
-def resolve_year_month_paths(spark, base_path: str, taxi_type: str,
-                              start_year_month: str = None, end_year_month: str = None):
+def resolve_year_months(spark, base_path: str, taxi_type: str,
+                         start_year_month: str = None, end_year_month: str = None):
     """
-    Returns the list of <base_path>/<taxi_type>/year=Y/month=M paths that
-    fall within [start_year_month, end_year_month] (inclusive; either bound
-    may be omitted to mean "earliest/latest available") AND actually exist in
-    the source. Months inside the requested range that don't exist are
-    logged as warnings and skipped, not treated as errors - there's no
-    metadata table to distinguish "not yet collected" from "genuinely
-    doesn't exist", so we simply process what's there.
+    Returns the list of (year, month) tuples that fall within
+    [start_year_month, end_year_month] (inclusive; either bound may be
+    omitted to mean "earliest/latest available") AND actually exist under
+    <base_path>/<taxi_type>/year=*/month=*. Months inside the requested
+    range that don't exist are logged as warnings and skipped, not treated
+    as errors - there's no metadata table to distinguish "not yet
+    collected" from "genuinely doesn't exist", so we simply process what's
+    there.
     """
     type_path = f"{base_path.rstrip('/')}/{taxi_type}"
     available = list_available_year_months(spark, base_path, taxi_type)
@@ -115,4 +116,32 @@ def resolve_year_month_paths(spark, base_path: str, taxi_type: str,
     matched_str = ", ".join(f"{y}-{m:02d}" for y, m in matched)
     print(f"[{taxi_type}] processing {len(matched)} month(s): {matched_str}")
 
+    return matched
+
+
+def resolve_year_month_paths(spark, base_path: str, taxi_type: str,
+                              start_year_month: str = None, end_year_month: str = None):
+    """
+    Same as resolve_year_months, but returns
+    <base_path>/<taxi_type>/year=Y/month=MM paths (zero-padded month) -
+    matches the nyc-taxi-collector S3 bucket layout, which is how source
+    data is read.
+    """
+    type_path = f"{base_path.rstrip('/')}/{taxi_type}"
+    matched = resolve_year_months(spark, base_path, taxi_type, start_year_month, end_year_month)
     return [f"{type_path}/year={y}/month={m:02d}" for y, m in matched]
+
+
+def raw_layer_month_paths(raw_layer_path: str, year_months):
+    """
+    Builds <raw_layer_path>/year=Y/month=M paths (NOT zero-padded) for the
+    given (year, month) tuples - matches how Spark's own
+    .partitionBy("year", "month") names directories when we write the raw
+    layer (save_raw_layer.py), which does not zero-pad. Used to scope the
+    Cleaned Layer's read to only the months this run actually cares about,
+    instead of reading the entire raw layer (which forces Spark to merge
+    schemas across every month ever written there, including older runs
+    whose files can have incompatible physical parquet encodings for the
+    same logical column - see docs/known_issues_and_fixes.md).
+    """
+    return [f"{raw_layer_path.rstrip('/')}/year={y}/month={m}" for y, m in year_months]
