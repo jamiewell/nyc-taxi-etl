@@ -45,7 +45,8 @@
 {
   "Version": "2012-10-17",
   "Statement": [
-    { "Sid": "DescribeInstances", "Effect": "Allow", "Action": "ec2:DescribeInstances", "Resource": "*" },
+    { "Sid": "DescribeInstances", "Effect": "Allow",
+      "Action": ["ec2:DescribeInstances", "ec2:DescribeInstanceStatus"], "Resource": "*" },
     { "Sid": "StartMasterOnly", "Effect": "Allow", "Action": "ec2:StartInstances",
       "Resource": "arn:aws:ec2:ap-northeast-2:962088872927:instance/i-0131fffaf58ee5509" },
     { "Sid": "ManageDeploySecurityGroupIngress", "Effect": "Allow",

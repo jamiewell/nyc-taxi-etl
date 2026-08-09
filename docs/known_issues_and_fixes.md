@@ -94,3 +94,20 @@ spark-daemon.sh start org.apache.spark.deploy.worker.Worker 1 spark://<master-ip
 Elastic IP를 쓰지 않기로 한 기존 결정(`docs/aws_infra_setup.md`)에 따라, 배포 워크플로우도 매 실행마다 `describe-instances`로 현재 Public IP를 동적 조회해서 SSH 대상으로 사용하도록 구성. 하드코딩된 IP를 GitHub Secrets 등에 저장하지 않음.
 
 **작업 순서상 특이사항**: 워크플로우 코드를 작성하기 전에, 마스터 인스턴스를 실제로 잠깐 기동해서 `rsync` 배포 + `python3 jobs/main.py --help` 검증까지 수동으로 먼저 실행해 각 단계(SSH 접속, rsync, venv 활성화, 배포된 코드 import)가 실제로 동작하는지 확인한 뒤, 그 명령어들을 그대로 워크플로우 YAML에 옮겼음. 이 과정에서 로컬 관리자 IP가 이전 등록값과 달라져 있어 보안그룹 규칙을 먼저 갱신해야 했음 (동적 IP 환경에서 인프라 작업 시 흔히 겪는 문제).
+
+**이슈 4: IAM 최소 권한 정책에서 `DescribeInstanceStatus` 누락 (실제 워크플로우 첫 실행에서 발견)**
+
+수동 검증(root 계정 자격증명 사용) 때는 문제없었지만, 실제로 GitHub Actions에서 배포 전용 IAM 사용자로 첫 실행했을 때 `Start master instance if stopped` 단계가 22초 만에 실패. `ec2:StartInstances`는 정상적으로 실행되어 인스턴스가 `stopped`→`pending`으로 전환됐지만, 바로 다음의 `aws ec2 wait instance-status-ok`가 다음 에러로 실패:
+
+```
+aws: [ERROR]: Waiter InstanceStatusOk failed: An error occurred (UnauthorizedOperation):
+You are not authorized to perform this operation. User: .../github-actions-nyc-taxi-deploy
+is not authorized to perform: ec2:DescribeInstanceStatus because no identity-based policy
+allows the ec2:DescribeInstanceStatus action
+```
+
+**원인**: `aws ec2 wait instance-status-ok`(및 `describe-instance-status`)는 `ec2:DescribeInstances`가 아니라 별개의 IAM 액션인 `ec2:DescribeInstanceStatus`를 필요로 함. 최소 권한 정책을 작성할 때 이걸 빠뜨림 — 두 API가 이름이 비슷해서 하나만 넣으면 될 거라고 착각하기 쉬운 부분.
+
+**조치**: IAM 인라인 정책의 `DescribeInstances` statement에 `ec2:DescribeInstanceStatus`를 추가. `docs/deployment.md`의 정책 스니펫도 함께 갱신.
+
+**교훈**: root 계정으로 사전에 수동 검증했더라도, root는 모든 권한을 갖고 있어 "최소 권한 IAM 정책이 실제로 충분한지"는 검증되지 않는다. 스코프를 좁힌 자격증명은 반드시 그 자격증명 자체로 최소 한 번 실제 실행까지 확인해야 한다.
