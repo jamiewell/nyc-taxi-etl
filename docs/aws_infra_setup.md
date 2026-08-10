@@ -121,7 +121,7 @@ spark-submit --master spark://172.31.3.142:7077 \
   --executor-cores 1 \
   --packages org.apache.hadoop:hadoop-aws:3.3.4 \
   --conf spark.eventLog.enabled=true \
-  --conf spark.eventLog.dir=/tmp/spark-events \
+  --conf spark.eventLog.dir=/home/ubuntu/spark-events \
   jobs/main.py \
   s3a://nyc-taxi-collector-raw/raw/nyc_taxi \
   s3a://nyc-taxi-batch-output \
@@ -133,19 +133,21 @@ spark-submit --master spark://172.31.3.142:7077 \
 
 - `--executor-memory`는 워커 스펙(1 core/1024MB)에 맞춰 여유있게 낮게 잡는다.
 - `data/reference/taxi_zone_lookup.csv`를 그대로 로컬 경로로 넘기면 실패한다 — `spark.read.csv()`는 분산 읽기라 executor(워커 노드)가 그 경로를 열려고 시도하는데, 코드는 마스터에만 배포되어 있어 워커엔 그 파일이 없다. 반드시 S3에 올려서 `s3a://` 경로로 넘겨야 한다 (`aws s3 cp data/reference/taxi_zone_lookup.csv s3://nyc-taxi-batch-output/reference/`).
-- `--conf spark.eventLog.enabled=true` / `spark.eventLog.dir=/tmp/spark-events`를 빼면 History Server에 아무 기록도 남지 않는다 (이후 History Server를 켜도 과거 실행 이력은 소급 복원 안 됨).
+- `--conf spark.eventLog.enabled=true` / `spark.eventLog.dir=/home/ubuntu/spark-events`를 빼면 History Server에 아무 기록도 남지 않는다 (이후 History Server를 켜도 과거 실행 이력은 소급 복원 안 됨).
 
 ## History Server
 
 ```bash
-mkdir -p /tmp/spark-events   # 반드시 먼저 생성 - 없으면 기동 직후 FileNotFoundException으로 죽음
+mkdir -p /home/ubuntu/spark-events   # 반드시 먼저 생성 - 없으면 기동 직후 FileNotFoundException으로 죽음
 source ~/pyspark-venv/bin/activate
 SPARK_HOME=$(python3 -c 'import pyspark,os; print(os.path.dirname(pyspark.__file__))')
-export SPARK_HISTORY_OPTS='-Dspark.history.fs.logDirectory=file:/tmp/spark-events'
+export SPARK_HISTORY_OPTS='-Dspark.history.fs.logDirectory=file:/home/ubuntu/spark-events'
 $SPARK_HOME/sbin/start-history-server.sh
 ```
 
 `jps`에 `HistoryServer`가 안 보이면 죽은 것이니, 로그(`~/pyspark-venv/lib/python3.10/site-packages/pyspark/logs/spark-*HistoryServer*.out`)를 확인한다. UI는 `http://<master-public-ip>:18080`.
+
+**반드시 `/tmp` 밖에 둘 것**: Ubuntu는 부팅할 때마다 `systemd-tmpfiles-setup.service`가 `/tmp` 내용을 지운다. `/tmp`가 별도 tmpfs라서가 아니라(루트 EBS 볼륨의 일부임, `mount`로 확인됨) systemd 서비스가 매 부팅마다 청소하는 것이라, EC2를 stop 후 다시 start(=재부팅)하면 `/tmp/spark-events`에 쌓아둔 이벤트 로그가 전부 사라진다. 홈 디렉터리(`/home/ubuntu/spark-events`)는 이 청소 대상이 아니라서 stop/start를 반복해도 유지된다 — 실제로 `/tmp/spark-events`로 처음 설정했다가 재기동 후 이력이 전부 날아간 걸 겪고 나서 옮김.
 
 ## 남은 작업
 

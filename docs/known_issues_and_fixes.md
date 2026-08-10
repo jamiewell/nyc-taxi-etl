@@ -167,3 +167,13 @@ Spark executor가 워커 노드에서 직접 S3를 읽고 쓰므로(driver뿐 �
 **조치**: `_round_double(column_name)` 헬퍼를 추가해 `col(name).cast(DoubleType())`을 먼저 적용한 뒤 반올림하도록 변경. yellow/green/fhvhv의 모든 요금·거리 컬럼에 일괄 적용해, 소스 월별 인코딩과 무관하게 Cleaned Layer 출력 타입을 항상 고정.
 
 **검증**: 로컬에서 한 달은 INT 타입, 다른 한 달은 DOUBLE 타입으로 `congestion_surcharge`를 강제로 다르게 인코딩한 synthetic 데이터를 만들어 각각 별도의 `spark-submit` 실행(실제 운영과 동일하게 서로 다른 실행에서 파티션이 쓰이는 상황 재현)으로 Cleaned Layer에 두 파티션을 쓴 뒤, Fact 단계가 둘을 합쳐 읽어도 실패하지 않는 것을 확인. 이후 실제 클러스터에서 2011-01(기존)+2011-11+2011-12(신규) 세 달을 합쳐 Fact/Mart까지 끝까지 성공하는 것으로 재확인.
+
+## 10. History Server 이벤트 로그가 EC2 stop/start(재부팅)마다 사라짐
+
+**증상**: 비용 절감을 위해 EC2를 stop했다가 다시 start한 뒤 History Server를 재기동했더니, 이전에 분명히 쌓여있던(`api/v1/applications`로 직접 확인했던) job 이력이 전부 사라지고 빈 목록으로 시작함.
+
+**원인**: `spark.eventLog.dir`/`spark.history.fs.logDirectory`를 `/tmp/spark-events`로 설정해뒀는데, `/tmp`는 별도 tmpfs 마운트가 아니라 루트 EBS 볼륨(`/dev/xvda1`)의 일반 디렉터리임(`mount`로 확인). 다만 Ubuntu는 `systemd-tmpfiles-setup.service`가 **매 부팅마다** `/tmp` 내용을 청소하도록 기본 설정되어 있어서, EC2 stop→start(=재부팅)를 거치면 디스크 자체는 멀쩡해도 `/tmp` 안의 내용만 사라짐. `~/nyc-taxi-batch`처럼 홈 디렉터리에 있던 배포 코드나 `~/spark-submit-*.log` 같은 실행 로그는 이 청소 대상이 아니라서 그대로 남아있었던 것과 대조됨.
+
+**조치**: `spark.eventLog.dir`와 `spark.history.fs.logDirectory`를 `/tmp/spark-events`에서 `/home/ubuntu/spark-events`(홈 디렉터리)로 변경. `docs/aws_infra_setup.md`의 표준 명령/History Server 기동 절차에 반영.
+
+**참고**: 이 방식은 EC2 **stop/start**에는 살아남지만, 인스턴스를 **terminate하고 새로 만들면** 당연히 EBS 볼륨 자체가 사라지므로 함께 사라진다. 인스턴스 교체까지 견디는 이력이 필요하면 `spark.eventLog.dir`를 `s3a://nyc-taxi-batch-output/spark-events` 같은 S3 경로로 돌리는 게 더 근본적인 해결책이지만, History Server는 `spark-submit`과 달리 `--packages`로 기동하지 않아서 `hadoop-aws` jar를 별도로 클래스패스에 올려야 하는 추가 작업이 필요함 (아직 미적용, 필요해지면 진행).
