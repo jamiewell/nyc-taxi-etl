@@ -177,3 +177,34 @@ Spark executor가 워커 노드에서 직접 S3를 읽고 쓰므로(driver뿐 �
 **조치**: `spark.eventLog.dir`와 `spark.history.fs.logDirectory`를 `/tmp/spark-events`에서 `/home/ubuntu/spark-events`(홈 디렉터리)로 변경. `docs/aws_infra_setup.md`의 표준 명령/History Server 기동 절차에 반영.
 
 **참고**: 이 방식은 EC2 **stop/start**에는 살아남지만, 인스턴스를 **terminate하고 새로 만들면** 당연히 EBS 볼륨 자체가 사라지므로 함께 사라진다. 인스턴스 교체까지 견디는 이력이 필요하면 `spark.eventLog.dir`를 `s3a://nyc-taxi-batch-output/spark-events` 같은 S3 경로로 돌리는 게 더 근본적인 해결책이지만, History Server는 `spark-submit`과 달리 `--packages`로 기동하지 않아서 `hadoop-aws` jar를 별도로 클래스패스에 올려야 하는 추가 작업이 필요함 (아직 미적용, 필요해지면 진행).
+
+## 11. 여러 달을 한 번에 합쳐 읽으면 물리 타입이 다른 소스 파일 자체가 못 읽힘 (2011-01~04 4개월 처리 중 발견)
+
+**배경**: `#9`에서 우리가 만든 Cleaned Layer 출력의 `congestion_surcharge` 타입 불일치는 고쳤다. 이번엔 그와 별개로, **TLC가 애초에 배포한 원본 소스 parquet 파일 자체**가 달마다 물리 타입이 다르다는 게 드러났다 (`2011-02` 원본은 `congestion_surcharge`가 INT32, 다른 달은 double). `--start-year-month 2011-01 --end-year-month 2011-04`로 한 번에 4개월을 처리하려다 STEP 1(Raw Layer, `save_raw_layer.read_source_data`가 4개월치 소스 경로를 `spark.read.parquet(*paths)`로 한 번에 읽는 지점)에서 바로 실패했다.
+
+```
+org.apache.spark.sql.execution.datasources.SchemaColumnConvertNotSupportedException:
+column: [congestion_surcharge], physicalType: INT32, logicalType: double
+```
+
+**시도 1 (실패): `spark.sql.parquet.enableVectorizedReader=false`**
+
+Parquet 물리 타입 불일치는 보통 "벡터화 리더가 타입 승격(int→double)을 못 해서 나는 문제"로 알려져 있고, 비벡터화(레거시 row 기반) 리더로 전환하면 해결된다는 게 일반적인 통설이다. 실제로 로컬에서 재현 테스트를 해보니 **이 Spark 버전(3.5.3)에서는 비벡터화 리더도 실패**했다 — 에러 종류만 바뀐다:
+
+```
+java.lang.ClassCastException: class ...MutableDouble cannot be cast to class ...MutableInt
+```
+
+즉 벡터화 여부와 무관하게, **물리 타입이 다른 여러 parquet 파일을 하나의 read 호출로 병합하는 것 자체를 Spark가 지원하지 않는다.** 설정 하나로 우회할 수 있는 문제가 아니었다.
+
+**시도 2 (성공): 파일을 합쳐서 읽지 않고, 달마다 개별로 읽어서 처리한 뒤 합치기**
+
+근본적인 해결책은 "여러 달을 한 번의 read 호출에 몰아넣지 않는 것"이다. 각 달을 **개별로** 읽으면 애초에 스키마를 병합할 필요 자체가 없어진다 (병합 대상이 파일 1개뿐이므로).
+
+`main.py`의 `run_raw_and_cleaned_layer`를 range 모드일 때 다음과 같이 재구성:
+- **STEP 1 (Raw Layer)**: `year_months` 리스트를 순회하며 월별로 `read_source_data` → `save_to_raw_layer`를 개별 호출. Raw Layer는 원본을 그대로 보존해야 하므로(캐스팅 금지) 이 방식이 유일한 해법 — 어차피 한 파일씩만 다루니 원본 물리 타입도 그대로 보존됨.
+- **STEP 2 (Cleaned Layer)**: 마찬가지로 월별 raw 파티션 경로를 순회하며 개별로 `read_raw_data` → `transform_to_cleaned` 호출 (이 단계에서 `#9`의 `_round_double()`이 각 월 DataFrame을 개별적으로 `DoubleType`으로 캐스팅), 그 결과 DataFrame들을 **캐스팅이 끝난 뒤에** `unionByName()`으로 합쳐서 씀. 캐스팅을 먼저 하고 합치는 순서가 핵심 — 합친 뒤에 캐스팅하려 하면 union 자체가 이미 스키마 병합을 요구해서 다시 같은 문제가 재발한다.
+
+**검증**: 로컬에서 4개월치 synthetic 소스 데이터를 `double/INT32/double/INT32` 순서로 강제로 다르게 인코딩해서 `--start-year-month 2011-01 --end-year-month 2011-04` 한 번의 `spark-submit` 실행으로 raw→cleaned→fact→mart까지 전부 성공하는 것을 확인 후 클러스터에 배포.
+
+**교훈**: "타입 불일치" 에러가 나면 반사적으로 벡터화 리더 설정부터 의심하게 되는데, 이번 케이스처럼 설정으로 우회가 안 되는 경우가 있다. 여러 파일을 한 번에 병합해서 읽어야 하는 구조 자체가 문제라면, 설정을 바꾸기보다 **애초에 병합이 필요 없도록 개별 처리 후 union**하는 쪽이 더 견고하다.

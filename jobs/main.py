@@ -33,6 +33,7 @@ def create_spark_session(app_name="NYC Taxi ETL", overwrite_mode="dynamic"):
     return SparkSession.builder \
         .appName(app_name) \
         .config("spark.sql.sources.partitionOverwriteMode", overwrite_mode) \
+        .config("spark.sql.optimizer.plannedWrite.enabled", "false") \
         .getOrCreate()
 
 
@@ -127,43 +128,75 @@ def run_raw_and_cleaned_layer(spark, source_path, base_output_path, taxi_type, i
     raw_layer_path = f"{base_output_path}/raw/{taxi_type}_trip"
     cleaned_layer_path = f"{base_output_path}/cleaned/{taxi_type}_trip"
 
-    # cleaned_read_path scopes STEP 2's read to just the months this run
-    # touches. Without it, Cleaned Layer would read the entire raw layer
-    # directory every time - forcing Spark to merge Parquet schemas across
-    # every month ever written there, including older runs whose files can
-    # have incompatible physical encodings for the same logical column (see
-    # docs/known_issues_and_fixes.md).
     if start_year_month or end_year_month:
         from collection_range import resolve_year_months, raw_layer_month_paths
         year_months = resolve_year_months(spark, source_path, taxi_type, start_year_month, end_year_month)
         type_path = f"{source_path.rstrip('/')}/{taxi_type}"
-        type_source_path = [f"{type_path}/year={y}/month={m:02d}" for y, m in year_months]
-        cleaned_read_path = raw_layer_month_paths(raw_layer_path, year_months)
+
+        # Months are read and written ONE AT A TIME here, not merged into a
+        # single spark.read.parquet(*paths) call. TLC's source files aren't
+        # internally consistent about physical Parquet encoding for the same
+        # logical column across different months (e.g. congestion_surcharge
+        # as INT32 in one month's file, DOUBLE in another's) - and Spark's
+        # Parquet reader cannot reconcile that within one combined read, with
+        # or without the vectorized reader (confirmed: vectorized raises
+        # SchemaColumnConvertNotSupportedException, non-vectorized raises a
+        # ClassCastException instead - same underlying limitation, no config
+        # fixes it). Reading month-by-month means each individual read only
+        # ever touches one file's schema, so the mismatch never has to be
+        # reconciled at read time. See docs/known_issues_and_fixes.md.
+        print("=" * 70)
+        print(f"STEP 1: Raw Layer ({taxi_type}) - Preserving source data")
+        print("=" * 70)
+        print(f"Raw Layer: {raw_layer_path}")
+        for y, m in year_months:
+            month_source_path = f"{type_path}/year={y}/month={m:02d}"
+            print(f"  Source ({y}-{m:02d}): {month_source_path}")
+            df_source = read_source_data(spark, month_source_path)
+            save_to_raw_layer(df_source, raw_layer_path, taxi_type=taxi_type)
+        print(f"✓ Raw Layer ({taxi_type}): COMPLETE\n")
+
+        print("=" * 70)
+        print(f"STEP 2: Cleaned Layer ({taxi_type}) - Quality filtering & standardization")
+        print("=" * 70)
+        print(f"Cleaned Layer: {cleaned_layer_path}")
+        cleaned_dfs = []
+        for month_raw_path in raw_layer_month_paths(raw_layer_path, year_months):
+            df_raw_month = read_raw_data(spark, month_raw_path)
+            # transform_to_cleaned casts fee/distance columns to a stable
+            # DoubleType (see raw_to_cleaned._round_double), so by the time
+            # these per-month DataFrames are unioned below, the physical
+            # type mismatch from the source is already resolved.
+            cleaned_dfs.append(transform_to_cleaned(df_raw_month, taxi_type=taxi_type))
+        df_cleaned = cleaned_dfs[0]
+        for other in cleaned_dfs[1:]:
+            df_cleaned = df_cleaned.unionByName(other)
+        write_cleaned_data(df_cleaned, cleaned_layer_path)
+        print(f"✓ Cleaned Layer ({taxi_type}): COMPLETE\n")
     else:
         type_source_path = f"{source_path}/{taxi_type}" if is_multi_type else source_path
-        cleaned_read_path = raw_layer_path
 
-    print("=" * 70)
-    print(f"STEP 1: Raw Layer ({taxi_type}) - Preserving source data")
-    print("=" * 70)
-    print(f"Source: {type_source_path}")
-    print(f"Raw Layer: {raw_layer_path}")
+        print("=" * 70)
+        print(f"STEP 1: Raw Layer ({taxi_type}) - Preserving source data")
+        print("=" * 70)
+        print(f"Source: {type_source_path}")
+        print(f"Raw Layer: {raw_layer_path}")
 
-    df_source = read_source_data(spark, type_source_path)
-    save_to_raw_layer(df_source, raw_layer_path, taxi_type=taxi_type)
+        df_source = read_source_data(spark, type_source_path)
+        save_to_raw_layer(df_source, raw_layer_path, taxi_type=taxi_type)
 
-    print(f"✓ Raw Layer ({taxi_type}): COMPLETE\n")
+        print(f"✓ Raw Layer ({taxi_type}): COMPLETE\n")
 
-    print("=" * 70)
-    print(f"STEP 2: Cleaned Layer ({taxi_type}) - Quality filtering & standardization")
-    print("=" * 70)
-    print(f"Cleaned Layer: {cleaned_layer_path}")
+        print("=" * 70)
+        print(f"STEP 2: Cleaned Layer ({taxi_type}) - Quality filtering & standardization")
+        print("=" * 70)
+        print(f"Cleaned Layer: {cleaned_layer_path}")
 
-    df_raw = read_raw_data(spark, cleaned_read_path)
-    df_cleaned = transform_to_cleaned(df_raw, taxi_type=taxi_type)
-    write_cleaned_data(df_cleaned, cleaned_layer_path)
+        df_raw = read_raw_data(spark, raw_layer_path)
+        df_cleaned = transform_to_cleaned(df_raw, taxi_type=taxi_type)
+        write_cleaned_data(df_cleaned, cleaned_layer_path)
 
-    print(f"✓ Cleaned Layer ({taxi_type}): COMPLETE\n")
+        print(f"✓ Cleaned Layer ({taxi_type}): COMPLETE\n")
 
     return cleaned_layer_path
 
