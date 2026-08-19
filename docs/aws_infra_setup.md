@@ -49,10 +49,12 @@ NYC Taxi 배치 파이프라인을 AWS EC2로 마이그레이션하기 위해 �
 
 | 역할 | Instance ID | Type | Private IP | Public IP |
 |---|---|---|---|---|
-| Master | `i-0131fffaf58ee5509` | t2.small | 172.31.3.142 | 3.34.200.25 |
-| Worker 1 | `i-079d25447827c38fa` | t2.small | 172.31.13.176 | 54.180.243.232 |
-| Worker 2 | `i-0b5d4a1f0d77eb2c7` | t2.small | 172.31.11.1 | 3.36.109.56 |
-| Worker 3 | `i-0e8f2fa3bc114aabc` | t2.small | 172.31.10.110 | 52.78.33.49 |
+| Master | `i-0131fffaf58ee5509` | t2.small | 172.31.3.142 | (stop/start마다 변경, 최신값은 `describe-instances`로 확인) |
+| Worker 1 | `i-079d25447827c38fa` | t2.medium | 172.31.13.176 | 〃 |
+| Worker 2 | `i-0b5d4a1f0d77eb2c7` | t2.medium | 172.31.11.1 | 〃 |
+| Worker 3 | `i-0e8f2fa3bc114aabc` | t2.medium | 172.31.10.110 | 〃 |
+
+> 워커는 2026-08-19에 t2.small(1 vCPU/2GB) → t2.medium(2 vCPU/4GB)으로 상향 (`docs/spark_tuning_results.md` Baseline S 참고 — 튜닝 실험 신호가 spill 노이즈에 묻히는 것을 막기 위함). 마스터는 t2.small 그대로 유지.
 
 **OS**: Ubuntu 22.04 LTS (AMI `ami-012a353bb3afb92ee`)
 
@@ -86,14 +88,15 @@ ssh -i ~/.ssh/nyc-taxi-cluster ubuntu@52.78.33.49    # worker 3
 
 | 역할 | 접속 주소 | 상태 |
 |---|---|---|
-| Master | `spark://172.31.3.142:7077`, UI `http://3.34.200.25:8080` | ALIVE |
-| Worker 1/2/3 | Master에 자동 등록 | 3대 모두 ALIVE, 각 1 core / 1024MB |
+| Master | `spark://172.31.3.142:7077`, UI `http://<master-public-ip>:8080` | ALIVE |
+| Worker 1/2/3 | Master에 자동 등록 | 3대 모두 ALIVE, 각 1 core / 3072MB (t2.medium 기준, `--memory 3g`로 워커 데몬 기동) |
 
 **검증**: `spark-submit --master spark://172.31.3.142:7077 examples/src/main/python/pi.py 10` 실행 → 클러스터 전체 분산 실행 확인 완료.
 
 **알려진 제약**:
 - `spark-daemon.sh`로 기동한 데몬은 systemd 서비스가 아니라 단순 프로세스라 **EC2 재부팅 시 자동 재기동되지 않음** — 상시 운영하려면 systemd unit 등록 필요.
-- Worker 리소스가 t2.small 스펙(1 core/1024MB)만큼만 잡혀 있어, job 제출 시 `--executor-memory`를 낮게(예: 512m) 지정하지 않으면 리소스 부족 발생 가능.
+- 워커 데몬 기동 시 `--memory 3g`를 명시해야 한다 (t2.medium 기준). 생략하면 Spark 기본값(시스템 메모리 - 1GB 근사치)이 잡히긴 하지만, 의도한 값인지 명확히 하기 위해 명시.
+- 워커에 `spark.worker.cleanup.enabled=true`(`SPARK_WORKER_OPTS`)를 켜두지 않으면 job마다 `pyspark/work/app-*/`에 `--packages` 의존성이 다시 스테이징되어 쌓이고, 반복 실험 중 디스크가 꽉 찰 수 있다 (`docs/known_issues_and_fixes.md` 참고 예정).
 
 ## S3 접근용 IAM Role (EC2 Instance Profile)
 
@@ -117,11 +120,12 @@ cd ~/nyc-taxi-batch
 spark-submit --master spark://172.31.3.142:7077 \
   --deploy-mode client \
   --driver-memory 512m \
-  --executor-memory 768m \
+  --executor-memory 2560m \
   --executor-cores 1 \
   --packages org.apache.hadoop:hadoop-aws:3.3.4 \
   --conf spark.eventLog.enabled=true \
   --conf spark.eventLog.dir=/home/ubuntu/spark-events \
+  --conf spark.sql.adaptive.enabled=false \
   jobs/main.py \
   s3a://nyc-taxi-collector-raw/raw/nyc_taxi \
   s3a://nyc-taxi-batch-output \
@@ -131,9 +135,10 @@ spark-submit --master spark://172.31.3.142:7077 \
   --end-year-month 2011-01
 ```
 
-- `--executor-memory`는 워커 스펙(1 core/1024MB)에 맞춰 여유있게 낮게 잡는다.
+- `--executor-memory`는 워커 스펙에 맞춰 잡는다. 워커는 2026-08-19부터 t2.medium(2 vCPU/4GB)으로 상향 — `docs/spark_tuning_results.md` Baseline S에서 t2.small(1 core/1024MB) 조건으로 memory spill이 소스 데이터의 270배(52GB)까지 발생해, 튜닝 실험 신호가 spill 노이즈에 묻히는 것을 막기 위함. 마스터는 t2.small 그대로 유지 — client 모드에서 드라이버가 마스터에서 돌지만, 대용량 row 데이터는 드라이버를 거치지 않고 executor↔executor(셔플) 또는 executor→S3(쓰기)로 직접 흐르므로 드라이버 메모리는 데이터 규모에 비례해서 늘릴 필요가 없다 (Baseline S에서 driver `maxMemory`는 약 116MB였고 spill도 전혀 없었음).
 - `data/reference/taxi_zone_lookup.csv`를 그대로 로컬 경로로 넘기면 실패한다 — `spark.read.csv()`는 분산 읽기라 executor(워커 노드)가 그 경로를 열려고 시도하는데, 코드는 마스터에만 배포되어 있어 워커엔 그 파일이 없다. 반드시 S3에 올려서 `s3a://` 경로로 넘겨야 한다 (`aws s3 cp data/reference/taxi_zone_lookup.csv s3://nyc-taxi-batch-output/reference/`).
 - `--conf spark.eventLog.enabled=true` / `spark.eventLog.dir=/home/ubuntu/spark-events`를 빼면 History Server에 아무 기록도 남지 않는다 (이후 History Server를 켜도 과거 실행 이력은 소급 복원 안 됨).
+- `--conf spark.sql.adaptive.enabled=false`: Spark 튜닝 실험(`docs/spark_tuning_plan.md`) 기간 동안 AQE를 고정 조건으로 끔 — AQE가 shuffle partition 수·join 전략을 런타임에 자동 조정하면, 이후 EXP들이 검증하려는 개별 변수(shuffle partitions, broadcast join 등)의 순수 효과를 가려서 비교가 어려워지기 때문. AQE 자체의 효과는 EXP-07에서 on/off 비교로 별도 검증.
 
 ## History Server
 

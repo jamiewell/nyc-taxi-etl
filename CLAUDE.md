@@ -168,6 +168,6 @@ Mart 생성 시 groupBy, dimension join, cumulative aggregation이 명확히 드
 
 - `docs/data_layer_design.md`: Raw/Cleaned/Fact/Mart 레이어 설계
 - `docs/data_modeling.md`: Fact/Dimension 테이블 설계
-<!-- - `docs/mart_design.md`: 목적별 Mart 테이블 설계 -->
-<!-- - `docs/spark_tuning_plan.md`: Spark 성능 실험 계획 -->
+- `docs/mart_design.md`: 목적별 Mart 테이블 설계
+- `docs/spark_tuning_plan.md`: Spark 성능 실험 계획
 <!-- - `docs/pipeline_roadmap.md`: 단계별 구현 로드맵 -->
