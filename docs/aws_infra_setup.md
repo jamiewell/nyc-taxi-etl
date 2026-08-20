@@ -125,7 +125,6 @@ spark-submit --master spark://172.31.3.142:7077 \
   --packages org.apache.hadoop:hadoop-aws:3.3.4 \
   --conf spark.eventLog.enabled=true \
   --conf spark.eventLog.dir=/home/ubuntu/spark-events \
-  --conf spark.sql.adaptive.enabled=false \
   jobs/main.py \
   s3a://nyc-taxi-collector-raw/raw/nyc_taxi \
   s3a://nyc-taxi-batch-output \
@@ -138,7 +137,7 @@ spark-submit --master spark://172.31.3.142:7077 \
 - `--executor-memory`는 워커 스펙에 맞춰 잡는다. 워커는 2026-08-19부터 t2.medium(2 vCPU/4GB)으로 상향 — `docs/spark_tuning_results.md` Baseline S에서 t2.small(1 core/1024MB) 조건으로 memory spill이 소스 데이터의 270배(52GB)까지 발생해, 튜닝 실험 신호가 spill 노이즈에 묻히는 것을 막기 위함. 마스터는 t2.small 그대로 유지 — client 모드에서 드라이버가 마스터에서 돌지만, 대용량 row 데이터는 드라이버를 거치지 않고 executor↔executor(셔플) 또는 executor→S3(쓰기)로 직접 흐르므로 드라이버 메모리는 데이터 규모에 비례해서 늘릴 필요가 없다 (Baseline S에서 driver `maxMemory`는 약 116MB였고 spill도 전혀 없었음).
 - `data/reference/taxi_zone_lookup.csv`를 그대로 로컬 경로로 넘기면 실패한다 — `spark.read.csv()`는 분산 읽기라 executor(워커 노드)가 그 경로를 열려고 시도하는데, 코드는 마스터에만 배포되어 있어 워커엔 그 파일이 없다. 반드시 S3에 올려서 `s3a://` 경로로 넘겨야 한다 (`aws s3 cp data/reference/taxi_zone_lookup.csv s3://nyc-taxi-batch-output/reference/`).
 - `--conf spark.eventLog.enabled=true` / `spark.eventLog.dir=/home/ubuntu/spark-events`를 빼면 History Server에 아무 기록도 남지 않는다 (이후 History Server를 켜도 과거 실행 이력은 소급 복원 안 됨).
-- `--conf spark.sql.adaptive.enabled=false`: Spark 튜닝 실험(`docs/spark_tuning_plan.md`) 기간 동안 AQE를 고정 조건으로 끔 — AQE가 shuffle partition 수·join 전략을 런타임에 자동 조정하면, 이후 EXP들이 검증하려는 개별 변수(shuffle partitions, broadcast join 등)의 순수 효과를 가려서 비교가 어려워지기 때문. AQE 자체의 효과는 EXP-07에서 on/off 비교로 별도 검증.
+- AQE는 명시적으로 끄지 않고 기본값(on)을 유지한다 — EXP-01/EXP-02에서 AQE off가 오히려 duration을 136.9% 악화시키는 것으로 확인되어 기각됐다 (`docs/spark_tuning_results.md` EXP-01/EXP-02 참고). AQE의 partition coalescing이 이 클러스터 규모(3 core)에서는 정적 `shuffle.partitions=200` 기본값보다 명백히 유리하다.
 
 ## History Server
 
