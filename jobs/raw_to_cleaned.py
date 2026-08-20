@@ -20,7 +20,7 @@ from pyspark.sql.functions import (
     round as spark_round, unix_timestamp, current_timestamp,
     concat_ws
 )
-from pyspark.sql.types import DoubleType
+from pyspark.sql.types import DoubleType, LongType
 
 VALID_TAXI_TYPES = ("yellow", "green", "fhvhv", "fhv")
 
@@ -145,6 +145,20 @@ def _round_double(column_name: str, decimals: int = 2):
     return spark_round(col(column_name).cast(DoubleType()), decimals)
 
 
+def _cast_long(column_name: str):
+    """
+    Same rationale as _round_double, for integer-typed ID/count columns
+    (vendor_id, location IDs, ratecode_id, payment_type, passenger_count).
+    Observed directly: vendor_id physically encoded as INT32 in one 2024
+    month's source file and as bigint (LongType) in others, which crashes
+    Fact-layer reads that combine months across a full year the same way
+    congestion_surcharge did (see docs/known_issues_and_fixes.md). Casting
+    to LongType at Cleaned Layer build time gives every month's output a
+    stable physical type regardless of what a given month's source used.
+    """
+    return col(column_name).cast(LongType())
+
+
 def _log_filter_stats(initial_count: int, filtered_count: int) -> None:
     filtered_out = initial_count - filtered_count
     filter_rate = (filtered_count / initial_count * 100) if initial_count > 0 else 0
@@ -175,17 +189,17 @@ def _transform_yellow(df: DataFrame) -> DataFrame:
 
     return df_filtered.select(
         lit("yellow").alias("taxi_type"),
-        col("VendorID").alias("vendor_id"),
-        col("PULocationID").alias("pickup_location_id"),
-        col("DOLocationID").alias("dropoff_location_id"),
-        col("RatecodeID").alias("ratecode_id"),
-        col("payment_type"),
+        _cast_long("VendorID").alias("vendor_id"),
+        _cast_long("PULocationID").alias("pickup_location_id"),
+        _cast_long("DOLocationID").alias("dropoff_location_id"),
+        _cast_long("RatecodeID").alias("ratecode_id"),
+        _cast_long("payment_type").alias("payment_type"),
         col("store_and_fwd_flag"),
         col("pickup_datetime"),
         col("dropoff_datetime"),
         col("pickup_date"), col("year_month"), col("pickup_year"), col("pickup_month"),
         col("pickup_day"), col("pickup_hour"), col("pickup_dayofweek"),
-        col("passenger_count"),
+        _cast_long("passenger_count").alias("passenger_count"),
         _round_double("trip_distance").alias("trip_distance"),
         col("trip_duration_sec"), col("trip_duration_min"),
         _round_double("fare_amount").alias("fare_amount"),
@@ -223,18 +237,18 @@ def _transform_green(df: DataFrame) -> DataFrame:
 
     return df_filtered.select(
         lit("green").alias("taxi_type"),
-        col("VendorID").alias("vendor_id"),
-        col("PULocationID").alias("pickup_location_id"),
-        col("DOLocationID").alias("dropoff_location_id"),
-        col("RatecodeID").alias("ratecode_id"),
-        col("payment_type"),
+        _cast_long("VendorID").alias("vendor_id"),
+        _cast_long("PULocationID").alias("pickup_location_id"),
+        _cast_long("DOLocationID").alias("dropoff_location_id"),
+        _cast_long("RatecodeID").alias("ratecode_id"),
+        _cast_long("payment_type").alias("payment_type"),
         col("store_and_fwd_flag"),
         col("trip_type"),
         col("pickup_datetime"),
         col("dropoff_datetime"),
         col("pickup_date"), col("year_month"), col("pickup_year"), col("pickup_month"),
         col("pickup_day"), col("pickup_hour"), col("pickup_dayofweek"),
-        col("passenger_count"),
+        _cast_long("passenger_count").alias("passenger_count"),
         _round_double("trip_distance").alias("trip_distance"),
         col("trip_duration_sec"), col("trip_duration_min"),
         _round_double("fare_amount").alias("fare_amount"),
@@ -272,8 +286,8 @@ def _transform_fhvhv(df: DataFrame) -> DataFrame:
         col("hvfhs_license_num"),
         col("dispatching_base_num"),
         col("originating_base_num"),
-        col("PULocationID").alias("pickup_location_id"),
-        col("DOLocationID").alias("dropoff_location_id"),
+        _cast_long("PULocationID").alias("pickup_location_id"),
+        _cast_long("DOLocationID").alias("dropoff_location_id"),
         col("request_datetime"),
         col("on_scene_datetime"),
         col("pickup_datetime"),
@@ -315,8 +329,8 @@ def _transform_fhv(df: DataFrame) -> DataFrame:
         lit("fhv").alias("taxi_type"),
         col("dispatching_base_num"),
         col("Affiliated_base_number").alias("affiliated_base_num"),
-        col("PUlocationID").alias("pickup_location_id"),
-        col("DOlocationID").alias("dropoff_location_id"),
+        _cast_long("PUlocationID").alias("pickup_location_id"),
+        _cast_long("DOlocationID").alias("dropoff_location_id"),
         col("pickup_datetime"),
         col("dropoff_datetime"),
         col("pickup_date"), col("year_month"), col("pickup_year"), col("pickup_month"),

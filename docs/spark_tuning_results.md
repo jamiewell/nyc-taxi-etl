@@ -9,6 +9,7 @@
 | EXP-00 | Baseline S | yellow 2011-05 (1개월) | 없음 (튜닝 요소 미적용) | 1,158.0초 | PASS | 기준값 확정 |
 | EXP-01 | AQE off + Worker t2.medium | yellow 2011-05 (1개월, EXP-00과 동일) | `spark.sql.adaptive.enabled=false` + executor-memory 768MB→2560MB | 2,742.9초 (**+136.9%**) | PASS | **AQE off 기각**, 메모리 증설은 유지 |
 | EXP-02 | AQE on(복원) + Worker t2.medium 유지 | yellow 2011-05 (1개월, EXP-00/01과 동일) | AQE 기본값 복원, executor-memory 2560MB 유지 (memory 단독 효과 분리) | **1,062.7초 (EXP-00 대비 -8.2%)** | PASS | **새 기준선(Baseline S v2)으로 채택** |
+| EXP-03 | Baseline M (AQE 명시적 off) | yellow 2024-01~12 (12개월, 최초) | `spark.sql.adaptive.enabled=false` 명시 지정, t2.medium 유지 | 6,397.8초 (1h46m) | PASS (수정 후) | Baseline M 확정, 12개월 규모에서도 AQE off의 200-task 패턴 재확인 |
 
 ## EXP-00: Baseline S (튜닝 없음)
 
@@ -213,4 +214,73 @@ EXP-01에서 두 변수(메모리 증설 + AQE off)를 동시에 바꿔 개별 �
 - 적용 범위: `docs/aws_infra_setup.md` 표준 명령에서 `spark.sql.adaptive.enabled=false`를 제거해 AQE 기본값(on) 상태로 되돌린다 (TODO, 아직 미반영).
 - 부작용/주의점: t2.medium은 t2.small 대비 시간당 비용이 더 높다(온디맨드 기준 약 4배) — 실험 목적상 유지하되, 상시 운영 전환 시 비용 재검토 필요.
 - 다음 실험: 이 조건(worker t2.medium, AQE on, executor-memory 2560m)을 고정 조건으로 삼아 계획서 순서대로 EXP-03(shuffle partitions)부터 진행. 최대 병목 stage의 "반복 read 의심"은 EXP-06(Persist/Cache)에서 우선 검증.
+
+## EXP-03: Baseline M (12개월, yellow 2024-01~12, AQE 명시적 off)
+
+### 기본 정보
+
+- 실행 ID / Spark Application ID: `app-20260820140321-0002` (성공 실행; 최초 시도 `app-20260820080503-0001`는 데이터 무결성 버그로 재실행)
+- 실행 일시: 2026-08-20 14:03 ~ 15:49 UTC
+- 코드 commit: `e82042f` 이후 (이번 실험 중 `jobs/main.py`, `jobs/raw_to_cleaned.py`, `jobs/save_raw_layer.py` 수정, 아직 미커밋)
+- 실행 환경: AWS EC2 수동 Spark 클러스터, master t2.small + worker 3대 t2.medium
+- Spark 버전: 3.5.3
+- 데이터 범위: yellow 2024-01 ~ 2024-12 (12개월) — 이 프로젝트 최초의 다개월(월 수 두 자릿수) 배치
+- 입력 크기 / 파일 수 / row 수: 소스 parquet 12개(월 50~64MB, 총 ~693MB), 총 41,169,720 rows
+- executor 수 / cores / memory: worker 3대 × 1 core / 2560MB, driver 512MB
+
+### 가설
+
+없음(정식 실험 가설이 아니라 정기 규모 확장 Baseline). 다만 사용자가 "AQE를 명시적으로 끄고" 요청했으므로, EXP-01에서 1개월 규모로 확인된 "AQE off의 200-task 패턴"이 12개월 규모에서도 동일하게 나타나는지가 관찰 포인트.
+
+### 사전 발견 및 조치: 데이터 무결성 버그 (최초 시도 실패)
+
+**증상**: 첫 시도(`app-20260820080503-0001`)에서 Raw/Cleaned/Fact까지는 로그상 전부 "COMPLETE"였으나, S3에 저장된 실제 결과를 대조해보니 `year=2024/month=1`~`month=11` 파티션이 각각 6~7KB(원본 대비 사실상 0에 가까움)였고, 가장 마지막에 처리된 `month=12`만 정상 크기(72MB)였다.
+
+**원인**: `main.py`의 STEP 1이 12개월을 순차 반복하며 매번 `save_to_raw_layer`로 **같은 raw_layer_path에 대해 dynamic partition overwrite**를 수행했는데, TLC 원본 월별 parquet 파일은 100% 그 달로만 채워져 있지 않고 극소수(파일당 10~40건 수준)의 경계 노이즈 행(예: `2024-02` 파일 안에 실제 `pickup_datetime`이 1월인 행)을 포함한다. dynamic overwrite는 "그 실행에서 실제로 쓰인 파티션"을 교체하므로, `2024-02`를 처리하는 시점에 그 파일 속 소수의 1월 행이 `year=2024/month=1` 파티션에 dynamic overwrite로 쓰이면서, 직전에 이미 써둔 진짜 1월 데이터(수백만 건)를 그 몇 건짜리 파티션으로 **완전히 덮어썼다**. 이 패턴이 2월→3월→...→12월까지 연쇄적으로 반복되어, 결국 가장 나중에 쓰인 12월만 온전히 남고 나머지는 전부 소실됨.
+
+부수적으로 같은 시도에서 `vendor_id` 컬럼도 `#8-9`와 같은 클래스의 물리 타입 불일치(2024-12 파일만 INT32, 나머지는 bigint)가 있어 Fact 빌드 단계에서 크래시가 났었음 — 이건 이번 실행에서 함께 고쳤음(아래 조치 2).
+
+**조치 1 (파티션 덮어쓰기 충돌 해결)**: `jobs/save_raw_layer.py`에 `save_month_to_raw_layer()`를 신설. 기존처럼 `year(pickup_col)`/`month(pickup_col)`로 파생한 동적 파티션에 쓰는 대신, **소스 파일의 지정된(nominal) 연/월을 명시적 경로(`.../year=Y/month=M`)로 직접 지정해서 씀** (`df.write.mode("overwrite").parquet(explicit_path)`, `partitionBy` 미사용). 이렇게 하면 한 달 처리 시 그 달의 디렉터리만 건드리므로 다른 달과 절대 충돌하지 않고, 필터링도 하지 않으므로(모든 행 보존) "Raw 데이터는 수정하지 않는다" 원칙도 그대로 유지됨. `main.py` STEP 1 루프가 이 함수를 쓰도록 변경.
+
+**조치 2 (vendor_id 등 정수 컬럼 타입 불일치)**: `#9`의 `_round_double()`과 동일한 패턴으로 `_cast_long()` 헬퍼를 추가, `vendor_id`/`pickup_location_id`/`dropoff_location_id`/`ratecode_id`/`payment_type`/`passenger_count`에 전부 적용해 `LongType`으로 고정.
+
+**검증**: 로컬에서 "1월 파일(5건, 전부 1월)" + "2월 파일(6건 = 2월 5건 + 1월 경계 노이즈 1건)"을 합성해 재현 — 수정 전 코드였다면 1월 파티션이 노이즈 1건으로 덮어써졌을 상황을, 수정 후에는 1월 5건 그대로 유지 / 2월 6건(노이즈 포함, 소실 없음) 확인. 이후 클러스터에서 12개월 재실행 → 전 달이 58~75MB로 고르게 채워진 것으로 최종 확인(아래 결과 참고).
+
+### 결과
+
+| 지표 | 값 | 비고 |
+|---|---:|---|
+| 전체 duration | **6,397.8초 (1시간 46분 38초)** | 12개월, 41.2M rows |
+| 최대 병목 stage | 1,173.0초 (stage 186, 200 tasks) | AQE off로 인한 정적 shuffle.partitions=200 stage |
+| 2위 병목 stage | 848.1초 (stage 167, 27 tasks, input 2,796MB) | read→write 계열, EXP-00/01/02의 "반복 read 의심" stage와 동일 계열 |
+| numTasks≥100인 stage 수 | **52개** (EXP-01/02의 1개월 실험과 정확히 동일한 개수) | AQE off 시 stage/task **개수**는 데이터量과 무관하게 고정, task당 처理量만 늘어남 |
+| 그 52개 stage의 총 실행시간 | 2,368.2초 | 전체의 37.0% |
+| 총 memory spill | 21,888 MB | |
+| 총 disk spill | 5,869 MB | |
+| executor별 총 task 수 | 3,899 / 3,938 / 3,951 (총 12,795) | 균등 분배, skew 없음 |
+| executor별 GC time | 10.7~12.3초 | executor 총 실행시간(2,023~2,060초) 대비 0.5~0.6% — 매우 낮음 |
+| 실패/재시도 task | 0 | 안정적 |
+| 소스 rows | 41,169,720 (12개월 합) | |
+| fact_taxi_trip 누적 rows | 136,329,160 | 2011년치 4개월 + 2024년치 12개월 누적 |
+| raw 파티션 크기 (월별) | 58.2~75.0 MiB, 12개월 균등 | 버그 수정 후 정상 분포 확인 |
+
+### 정합성 검증
+
+- Mart Count/Amount validation: 4개 Mart 전부 `PASSED` (월별 monthly validation 포함)
+- raw layer 12개 파티션 크기 직접 대조: 전부 정상 범위(58~75MiB), 이상치 없음
+- 검증 결과: **PASS**
+
+### Spark UI 관찰
+
+- **EXP-01의 "AQE off → task 폭증" 패턴이 12개월 규모에서도 정확히 재현됨**: `numTasks≥100` stage 52개, 그 stage들의 총 task 수 10,300개 — **EXP-01(1개월)과 완전히 같은 숫자**. 즉 AQE off일 때 shuffle stage/task **개수**는 정적 `spark.sql.shuffle.partitions=200` 설정에만 좌우되고 데이터 크기와는 무관하며, 데이터가 늘어나면 그만큼 **task당 처리량**만 커진다(1개월 대비 12배 데이터를 같은 수의 task가 나눠 처리).
+- GC time 비중(0.5~0.6%)이 1개월 실험(EXP-02, ~1%)보다도 낮음 — executor-memory 2560MB가 12개월 규모 처理에도 여유가 있다는 뜻.
+- 여전히 최대 병목은 read→write 계열 stage(1,173초, 848초 두 개가 상위) — EXP-00부터 계속 제기된 "반복 read/과도한 buffering 의심"이 이번에도 재현됨. Column Pruning(EXP-04)과 Persist/Cache(EXP-06)로 이어서 확인 필요.
+- event log 위치: `/home/ubuntu/spark-events/app-20260820140321-0002`
+
+### 결론
+
+- 결과: Baseline M 확정 (12개월 규모의 정식 기준값)
+- 판단 근거: 정합성 PASS, 버그 수정 후 데이터 무결성 직접 검증 완료
+- 부작용/주의점(중요): 이번에 고친 **파티션 덮어쓰기 충돌 버그**는 지금까지의 모든 실험(EXP-00~02, 1~4개월 규모)에서는 우연히 재현되지 않았을 뿐, **다개월을 한 번에 처리하는 모든 시나리오에 잠재된 위험**이었다. 월 수가 많아지고 연속된 달을 처리할수록 재현 확률이 올라간다 — 이번 12개월 처리가 처음으로 확실히 걸린 사례. `docs/known_issues_and_fixes.md` #12에 별도 기록.
+- 다음 실험: 이 조건(12개월, AQE off, t2.medium)을 그대로 두고 EXP-04(Column Pruning)부터 이어가거나, 혹은 AQE on으로 되돌린 "진짜" Baseline M(EXP-02처럼 memory 단독 효과 재확인)을 먼저 잡을지는 다음 지시에 따름.
 

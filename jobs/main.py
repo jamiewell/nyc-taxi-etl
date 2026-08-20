@@ -122,7 +122,7 @@ def run_raw_and_cleaned_layer(spark, source_path, base_output_path, taxi_type, i
     Runs Raw Layer + Cleaned Layer for a single taxi type.
     Returns the cleaned layer path so the caller can feed it into Fact/Dim.
     """
-    from save_raw_layer import read_source_data, save_to_raw_layer
+    from save_raw_layer import read_source_data, save_to_raw_layer, save_month_to_raw_layer
     from raw_to_cleaned import read_raw_data, transform_to_cleaned, write_cleaned_data
 
     raw_layer_path = f"{base_output_path}/raw/{taxi_type}_trip"
@@ -153,7 +153,12 @@ def run_raw_and_cleaned_layer(spark, source_path, base_output_path, taxi_type, i
             month_source_path = f"{type_path}/year={y}/month={m:02d}"
             print(f"  Source ({y}-{m:02d}): {month_source_path}")
             df_source = read_source_data(spark, month_source_path)
-            save_to_raw_layer(df_source, raw_layer_path, taxi_type=taxi_type)
+            # save_month_to_raw_layer (not save_to_raw_layer) - writes to an
+            # explicit year=/month= path keyed by this source file's nominal
+            # month, so a later month's stray boundary rows can never
+            # overwrite an earlier month's partition. See
+            # jobs/save_raw_layer.py and docs/known_issues_and_fixes.md.
+            save_month_to_raw_layer(df_source, raw_layer_path, taxi_type, y, m)
         print(f"✓ Raw Layer ({taxi_type}): COMPLETE\n")
 
         print("=" * 70)
