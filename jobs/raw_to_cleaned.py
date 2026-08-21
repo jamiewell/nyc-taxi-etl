@@ -125,7 +125,15 @@ def read_raw_data(spark, input_path, select_columns=None):
         raise ValueError(f"Failed to load data from {paths}")
 
     if select_columns is not None:
-        available = [c for c in select_columns if c in df.columns]
+        # Case-insensitive match, mirroring Spark SQL's own default column
+        # resolution (spark.sql.caseSensitive=false) - discovered the hard
+        # way: this project's yellow schema uses "Airport_fee" in most
+        # months but "airport_fee" in at least one (2011-05), and a plain
+        # Python `in` check missed the lowercase variant, silently dropping
+        # a column that _transform_yellow still references by its usual
+        # capitalization, which then failed to resolve downstream.
+        lower_to_actual = {c.lower(): c for c in df.columns}
+        available = [lower_to_actual[c.lower()] for c in select_columns if c.lower() in lower_to_actual]
         dropped = [c for c in df.columns if c not in available]
         print(f"Column pruning: keeping {len(available)}/{len(df.columns)} columns, dropping {dropped}")
         df = df.select(*available)
