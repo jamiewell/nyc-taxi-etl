@@ -123,7 +123,7 @@ def run_raw_and_cleaned_layer(spark, source_path, base_output_path, taxi_type, i
     Returns the cleaned layer path so the caller can feed it into Fact/Dim.
     """
     from save_raw_layer import read_source_data, save_to_raw_layer, save_month_to_raw_layer
-    from raw_to_cleaned import read_raw_data, transform_to_cleaned, write_cleaned_data
+    from raw_to_cleaned import read_raw_data, transform_to_cleaned, write_cleaned_data, REQUIRED_SOURCE_COLUMNS
 
     raw_layer_path = f"{base_output_path}/raw/{taxi_type}_trip"
     cleaned_layer_path = f"{base_output_path}/cleaned/{taxi_type}_trip"
@@ -167,7 +167,9 @@ def run_raw_and_cleaned_layer(spark, source_path, base_output_path, taxi_type, i
         print(f"Cleaned Layer: {cleaned_layer_path}")
         cleaned_dfs = []
         for month_raw_path in raw_layer_month_paths(raw_layer_path, year_months):
-            df_raw_month = read_raw_data(spark, month_raw_path)
+            # EXP-01 Column Pruning: only select the source columns this
+            # taxi_type's transform actually uses (docs/spark_tuning_plan.md).
+            df_raw_month = read_raw_data(spark, month_raw_path, select_columns=REQUIRED_SOURCE_COLUMNS.get(taxi_type))
             # transform_to_cleaned casts fee/distance columns to a stable
             # DoubleType (see raw_to_cleaned._round_double), so by the time
             # these per-month DataFrames are unioned below, the physical
@@ -197,7 +199,7 @@ def run_raw_and_cleaned_layer(spark, source_path, base_output_path, taxi_type, i
         print("=" * 70)
         print(f"Cleaned Layer: {cleaned_layer_path}")
 
-        df_raw = read_raw_data(spark, raw_layer_path)
+        df_raw = read_raw_data(spark, raw_layer_path, select_columns=REQUIRED_SOURCE_COLUMNS.get(taxi_type))
         df_cleaned = transform_to_cleaned(df_raw, taxi_type=taxi_type)
         write_cleaned_data(df_cleaned, cleaned_layer_path)
 

@@ -24,8 +24,50 @@ from pyspark.sql.types import DoubleType, LongType
 
 VALID_TAXI_TYPES = ("yellow", "green", "fhvhv", "fhv")
 
+# EXP-01 (Column Pruning, docs/spark_tuning_plan.md): the exact source
+# columns each _transform_* function references, EXCLUDING the "year"/
+# "month" helper columns save_raw_layer.py adds to the Raw layer for its
+# own partitioning (Cleaned re-derives its own pickup_year/pickup_month
+# from the timestamp, so those two raw-only columns are never used here).
+# Passed to read_raw_data's select_columns so the projection is pushed
+# down to the Parquet scan before any .count()/.filter() action, instead
+# of happening only at the final .select() inside _transform_*.
+REQUIRED_SOURCE_COLUMNS = {
+    "yellow": [
+        "VendorID", "tpep_pickup_datetime", "tpep_dropoff_datetime",
+        "PULocationID", "DOLocationID", "RatecodeID", "payment_type",
+        "store_and_fwd_flag", "passenger_count", "trip_distance",
+        "fare_amount", "extra", "mta_tax", "tip_amount", "tolls_amount",
+        "improvement_surcharge", "total_amount", "congestion_surcharge",
+        "Airport_fee", "cbd_congestion_fee",
+    ],
+    "green": [
+        "VendorID", "lpep_pickup_datetime", "lpep_dropoff_datetime",
+        "PULocationID", "DOLocationID", "RatecodeID", "payment_type",
+        "store_and_fwd_flag", "trip_type", "passenger_count", "trip_distance",
+        "fare_amount", "extra", "mta_tax", "tip_amount", "tolls_amount",
+        "ehail_fee", "improvement_surcharge", "total_amount",
+        "congestion_surcharge", "cbd_congestion_fee",
+    ],
+    "fhvhv": [
+        "hvfhs_license_num", "dispatching_base_num", "originating_base_num",
+        "PULocationID", "DOLocationID", "request_datetime", "on_scene_datetime",
+        "pickup_datetime", "dropoff_datetime", "trip_miles", "trip_time",
+        "base_passenger_fare", "tolls", "bcf", "sales_tax",
+        "congestion_surcharge", "airport_fee", "tips", "driver_pay",
+        "cbd_congestion_fee", "shared_request_flag", "shared_match_flag",
+        "wav_request_flag", "wav_match_flag",
+    ],
+    "fhv": [
+        "dispatching_base_num", "Affiliated_base_number",
+        "PUlocationID", "DOlocationID", "pickup_datetime", "dropOff_datetime",
+        "SR_Flag",
+    ],
+}
 
-def read_raw_data(spark, input_path):
+
+
+def read_raw_data(spark, input_path, select_columns=None):
     """
     Read raw NYC taxi data from parquet/csv
     Supports local filesystem, S3, GCS, HDFS
@@ -39,6 +81,16 @@ def read_raw_data(spark, input_path):
     incompatible physical encodings for the same logical column (observed
     with congestion_surcharge: double in one month's file, INT32 in
     another's - see docs/known_issues_and_fixes.md).
+
+    select_columns (EXP-01, Column Pruning): optional list of column names
+    to keep, applied immediately after the read and before the validation
+    .count() - so the projection reaches the Parquet scan (and every
+    downstream action, including the .count()/.filter() calls inside
+    transform_to_cleaned) instead of only being applied at the final
+    .select() inside _transform_*. Columns not present in this particular
+    file are silently skipped rather than erroring, since some fee columns
+    (e.g. cbd_congestion_fee) don't exist in older months - see
+    _with_optional_double_columns, which still backfills those afterward.
     """
     paths = input_path if isinstance(input_path, list) else [input_path]
     print(f"Reading raw data from ({len(paths)} path(s)): {paths}")
@@ -71,6 +123,12 @@ def read_raw_data(spark, input_path):
     # Validate
     if df is None:
         raise ValueError(f"Failed to load data from {paths}")
+
+    if select_columns is not None:
+        available = [c for c in select_columns if c in df.columns]
+        dropped = [c for c in df.columns if c not in available]
+        print(f"Column pruning: keeping {len(available)}/{len(df.columns)} columns, dropping {dropped}")
+        df = df.select(*available)
 
     record_count = df.count()
     if record_count == 0:
