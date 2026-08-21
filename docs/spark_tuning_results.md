@@ -10,6 +10,7 @@
 | EXP-01 | AQE off + Worker t2.medium | yellow 2011-05 (1개월, EXP-00과 동일) | `spark.sql.adaptive.enabled=false` + executor-memory 768MB→2560MB | 2,742.9초 (**+136.9%**) | PASS | **AQE off 기각**, 메모리 증설은 유지 |
 | EXP-02 | AQE on(복원) + Worker t2.medium 유지 | yellow 2011-05 (1개월, EXP-00/01과 동일) | AQE 기본값 복원, executor-memory 2560MB 유지 (memory 단독 효과 분리) | **1,062.7초 (EXP-00 대비 -8.2%)** | PASS | **새 기준선(Baseline S v2)으로 채택** |
 | EXP-03 | Baseline M (AQE 명시적 off) | yellow 2024-01~12 (12개월, 최초) | `spark.sql.adaptive.enabled=false` 명시 지정, t2.medium 유지 | 6,397.8초 (1h46m) | PASS (수정 후) | Baseline M 확정, 12개월 규모에서도 AQE off의 200-task 패턴 재확인 |
+| EXP-04 | Column Pruning (계획서 EXP-01) | yellow 2011-05 (1개월, EXP-02와 동일) | Cleaned Layer 읽기 직후 `select_columns`로 필요 컬럼만 명시 선택 | 1,693.0초 (측정치, 해석은 본문 참고) | PASS | **채택 보류** — 0컬럼 pruning 확인, duration 차이는 인프라 노이즈로 판단 |
 
 ## EXP-00: Baseline S (튜닝 없음)
 
@@ -283,4 +284,69 @@ EXP-01에서 두 변수(메모리 증설 + AQE off)를 동시에 바꿔 개별 �
 - 판단 근거: 정합성 PASS, 버그 수정 후 데이터 무결성 직접 검증 완료
 - 부작용/주의점(중요): 이번에 고친 **파티션 덮어쓰기 충돌 버그**는 지금까지의 모든 실험(EXP-00~02, 1~4개월 규모)에서는 우연히 재현되지 않았을 뿐, **다개월을 한 번에 처리하는 모든 시나리오에 잠재된 위험**이었다. 월 수가 많아지고 연속된 달을 처리할수록 재현 확률이 올라간다 — 이번 12개월 처리가 처음으로 확실히 걸린 사례. `docs/known_issues_and_fixes.md` #12에 별도 기록.
 - 다음 실험: 이 조건(12개월, AQE off, t2.medium)을 그대로 두고 EXP-04(Column Pruning)부터 이어가거나, 혹은 AQE on으로 되돌린 "진짜" Baseline M(EXP-02처럼 memory 단독 효과 재확인)을 먼저 잡을지는 다음 지시에 따름.
+
+## EXP-04: Column Pruning (계획서 EXP-01, `exp01-column-pruning` 브랜치)
+
+> 계획서(`docs/spark_tuning_plan.md`)의 실험 번호는 "EXP-01"이지만, 이 결과 문서에서는 이미 다른 실험이 EXP-01(AQE off + t2.medium)을 선점하고 있어 **EXP-04**로 기록한다. 코드/브랜치명은 사용자 요청대로 `exp01-column-pruning`을 유지.
+
+### 기본 정보
+
+- 브랜치: `exp01-column-pruning` (base: `main` `0753b5a`) — **main은 전혀 수정하지 않음**
+- 커밋: `ea5f739`(초기 구현), `5ac8b6f`(대소문자 매칭 버그 수정)
+- 실행 ID / Spark Application ID: `app-20260821042041-0001` (성공; 최초 시도 `app-20260821041701-0000`는 컬럼명 대소문자 버그로 실패, 78초 만에 크래시)
+- 실행 일시: 2026-08-21 04:20 ~ 04:48 UTC
+- 실행 환경: AWS EC2, master t2.small + worker 3대 t2.medium (EXP-02와 동일 스펙)
+- 데이터 범위: yellow 2011-05 (1개월) — **EXP-02와 동일**
+- executor 수 / cores / memory: worker 3대 × 1 core / 2560MB, driver 512MB, **AQE는 기본값(on)** — EXP-02와 동일 조건
+
+### 가설
+
+계획서 EXP-01 원문 가설: "ETL에 필요한 컬럼만 select하면 Parquet에서 읽는 데이터와 메모리 사용량이 감소한다."
+
+### 실험 범위 (사용자 지정)
+
+이번 실험은 **raw→cleaned 전처리·저장 구간에만** 한정한다 — Raw Layer 저장(원본 그대로 보존), Fact/Dim, Mart는 손대지 않음. 최초 베이스라인(main)의 `_transform_yellow`는 이미 필요한 출력 컬럼을 `.select()`로 명시하고 있었으므로, 이번 실험의 실질적 변경은 "그 select 시점을 Cleaned 변환 마지막 단계에서 **Raw 읽기 직후**로 앞당기는 것"이다 — `raw_to_cleaned.read_raw_data()`에 `select_columns` 파라미터를 추가해, `.count()`/`.filter()` 등 어떤 액션보다도 먼저 컬럼 projection이 걸리도록 함.
+
+### 구현
+
+- `jobs/raw_to_cleaned.py`: 타입별 실제 필요 원본 컬럼 목록(`REQUIRED_SOURCE_COLUMNS`) 정의. `read_raw_data(spark, input_path, select_columns=None)` — 지정 시 읽기 직후 `.select()` 수행, `df.columns`에 실제로 없는 컬럼은 조용히 스킵.
+- `jobs/main.py`: Cleaned Layer 읽기 호출부(범위 모드/단일 모드 둘 다)에 `select_columns=REQUIRED_SOURCE_COLUMNS.get(taxi_type)` 전달.
+
+### 개발 중 발견한 버그 (실험 자체와는 별개)
+
+**1차 시도 실패** (`app-20260821041701-0000`, 78초): `Airport_fee` 컬럼을 찾을 수 없다는 에러. 원인은 2011-05 원본 파일의 해당 컬럼명이 `airport_fee`(소문자)였는데, `select_columns` 매칭을 Python `in` 연산자(대소문자 구분)로 했기 때문에 `Airport_fee`(대문자, 코드에 하드코딩된 표기)와 매칭이 안 되어 그 컬럼이 조용히 drop됐고, 이후 `_transform_yellow`가 `col("Airport_fee")`를 참조하는 지점에서 실패. Spark SQL 자체는 기본적으로 컬럼명을 대소문자 구분 없이 resolve하는데, 내가 추가한 Python 레벨 필터링만 그 규칙을 안 따른 게 원인. `df.columns`와 대소문자 무시 매칭을 하도록 수정(`5ac8b6f`)해서 해결 — 로컬 재현 검증 후 재배포.
+
+### 결과
+
+| 지표 | EXP-02 (기준, pruning 없음) | EXP-04 (pruning 적용) | 비고 |
+|---|---:|---:|---|
+| 컬럼 pruning 결과 | 해당 없음 | **19/19 유지, 0개 drop** | 이 taxi_type/월엔 애초에 불필요한 컬럼이 없었음 |
+| 전체 duration | 1,062.7초 | 1,693.0초 (+59.3%) | **아래 "해석" 참고 — 실제 코드 효과로 보지 않음** |
+| 최대 병목 stage | 595.9초 | 838.7초 | |
+| 총 memory spill | 23,936 MB | 24,320 MB | 거의 동일 (오차범위) |
+| 총 disk spill | 6,366 MB | 6,427 MB | 거의 동일 |
+| executor별 GC time | 8.5~9.5초 | 8.5~10.0초 | 거의 동일 |
+| 실패/재시도 task | 0 | 0 | |
+| raw 파티션 크기 | (EXP-02 기록 없음) | 241.5 MiB | 정상 범위 (기존 실행들과 비슷한 수준) |
+| cleaned 파티션 크기 | (EXP-02 기록 없음) | 286.9 MiB | 정상 범위 |
+
+### 해석 — duration 차이를 pruning 효과로 보지 않는 이유
+
+1. **메커니즘적으로 pruning이 아무 일도 하지 않았다**: `keeping 19/19 columns, dropping []` — DataFrame이 EXP-02와 완전히 동일한 스키마로 처리됐다. 코드가 다른데 결과 DataFrame이 같다면, duration 차이의 원인은 코드가 아니라 다른 곳에 있다고 봐야 한다.
+2. **spill/GC/실패 task 등 메모리·안정성 지표는 EXP-02와 오차범위 내로 거의 동일**하다 — 유일하게 크게 벌어진 지표가 duration(그리고 그와 연동된 stage runtime)뿐이라는 것은, 계산량이 아니라 **처리 속도 자체의 변동**(예: 클러스터 콜드스타트, t2 버스터블 인스턴스의 CPU 크레딧/호스트 변동성)을 가리킨다.
+3. 계획서 3.2절이 "각 조건 3회 이상 반복 측정, 중앙값 사용"을 요구하는 것도 정확히 이런 이유다. 이번 실험은 EXP-02와 마찬가지로 **단일 실행**이라, 두 실행 사이의 차이를 통계적으로 유의미하다고 주장할 근거가 없다.
+
+### 정합성 검증
+
+- Mart Count/Amount validation: 4개 Mart 전부 `PASSED`
+- raw/cleaned 파티션 크기 S3 직접 대조: 정상 범위, 이상치 없음
+- 검증 결과: **PASS**
+
+### 결론
+
+- 결과: **채택 보류(inconclusive)** — 이 데이터 규모/타입에서는 pruning할 컬럼이 원천적으로 없어(0/19 drop) 실질적으로 검증 불가능한 조건이었다. "효과가 있다/없다" 어느 쪽도 이 실험만으로는 결론 낼 수 없다.
+- 판단 근거: 계획서가 이미 예견한 케이스("row 기반 포맷이나 실제로 모든 컬럼을 사용하는 경우 효과가 작을 수 있다")에 정확히 해당. `_transform_yellow`가 원본 19개 컬럼을 전부 참조하므로, 이 taxi_type에 한해서는 raw→cleaned 구간에서 pruning으로 얻을 이득이 구조적으로 없다.
+- 적용 범위: main 브랜치에는 병합하지 않음 (사용자 지시). 코드/실험 기록 모두 `exp01-column-pruning` 브랜치에만 존재.
+- 부수 성과: 대소문자 구분 없는 컬럼 매칭 버그를 실제 데이터로 잡아냄 — 향후 다른 실험에서 컬럼명을 문자열로 다룰 때 참고할 만한 사례로 `docs/known_issues_and_fixes.md`에 별도 기록할 가치가 있음(아직 미기록).
+- 다음 실험: 컬럼이 실제로 남아도는 taxi_type(예: fhv — 원본 7개 컬럼 중 일부만 씀)이나 다른 레이어(Fact→Mart 구간, Mart가 fact_taxi_trip의 30개 컬럼 중 일부만 쓰는지 확인)에서 재시도하면 pruning 효과를 실제로 관찰할 여지가 있음. 또는 이번 결과의 duration 차이가 진짜 노이즈인지 확인하려면 동일 조건으로 반복 측정(3회+) 필요.
 
